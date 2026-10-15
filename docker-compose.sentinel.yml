@@ -1,0 +1,59 @@
+name: chatgpt2api
+
+services:
+  app:
+    image: pansx/chatgpt2api:sentinel-2026-10
+    restart: unless-stopped
+    ports:
+      - "8000:80"
+    environment:
+      STORAGE_BACKEND: sqlite
+      CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:?set CHATGPT2API_AUTH_KEY}
+      CHATGPT2API_SENTINEL_SOLVER_URL: http://sentinel-solver:8080
+      CHATGPT2API_SENTINEL_SOLVER_KEY: ${SENTINEL_SOLVER_KEY:-}
+      # Optional: the main service reads this from config.json at startup.
+      CHATGPT2API_PROXY: ${CHATGPT2API_PROXY:-}
+    volumes:
+      - app-data:/app/data
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        /app/.venv/bin/python - <<'PY'
+        import json, os
+        from pathlib import Path
+        saved = Path('/app/data/runtime/config.json')
+        saved.parent.mkdir(parents=True, exist_ok=True)
+        data = json.loads(saved.read_text()) if saved.exists() else {}
+        if os.environ.get('CHATGPT2API_PROXY'):
+            data['proxy'] = os.environ['CHATGPT2API_PROXY']
+        saved.write_text(json.dumps(data))
+        config = Path('/app/config.json')
+        config.unlink(missing_ok=True)
+        config.symlink_to(saved)
+        PY
+        exec /app/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 80
+    depends_on:
+      sentinel-solver:
+        condition: service_healthy
+
+  sentinel-solver:
+    image: pansx/chatgpt2api-sentinel-solver:sentinel-2026-10
+    restart: unless-stopped
+    environment:
+      SENTINEL_SOLVER_KEY: ${SENTINEL_SOLVER_KEY:-}
+      SENTINEL_SOLVER_PROXY: ${SENTINEL_SOLVER_PROXY:-${CHATGPT2API_PROXY:-}}
+      HTTP_PROXY: ${SENTINEL_SOLVER_DOWNLOAD_PROXY:-${CHATGPT2API_PROXY:-}}
+      HTTPS_PROXY: ${SENTINEL_SOLVER_DOWNLOAD_PROXY:-${CHATGPT2API_PROXY:-}}
+      NO_PROXY: localhost,127.0.0.1
+    volumes:
+      - browser-cache:/ms-playwright
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=5))['ready']"]
+      start_period: 30m
+      interval: 10s
+      timeout: 6s
+      retries: 3
+
+volumes:
+  app-data:
+  browser-cache:

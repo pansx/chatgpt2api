@@ -1,0 +1,11 @@
+安装完成。主服务和 sentinel solver 已自动连接。
+首次启动 solver 会下载 Chromium 并安装系统依赖，可能需要数分钟。
+
+查看状态：
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+本地访问：
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "c.name" . }} 8000:{{ .Values.service.port }}
+
+读取自动生成的 API 密钥：
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "c.name" . }} -o jsonpath='{.data.auth-key}' | base64 -d
