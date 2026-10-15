@@ -47,6 +47,17 @@ class BrowserRoutingTests(unittest.TestCase):
         get.assert_not_called()
         post.assert_not_called()
 
+    def test_homepage_challenge_does_not_abort_browser_handshake(self):
+        response = mock.Mock(status_code=403, headers={"content-type": "text/html"})
+        with mock.patch.object(self.api.session, "get", return_value=response):
+            self.api._bootstrap()
+        self.assertEqual(self.api.pow_script_sources, [backend.DEFAULT_POW_SCRIPT])
+        self.assertEqual(self.api.pow_data_build, "")
+        response.headers = {"content-type": "application/json"}
+        with mock.patch.object(self.api.session, "get", return_value=response):
+            with self.assertRaises(backend.UpstreamHTTPError):
+                self.api._bootstrap()
+
     def test_auth_rejection_is_not_retried_or_sent_to_curl(self):
         for status, error in ((401, backend.InvalidAccessTokenError), (403, RuntimeError)):
             with self.subTest(status=status), mock.patch.object(
