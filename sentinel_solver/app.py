@@ -54,30 +54,61 @@ window.chrome = window.chrome || { runtime: {} };
 # whatever the frontend does next; calling the shipped module does not.
 #
 # The chunk is content-hashed and changes on every deploy, so it is discovered at
-# solve time instead of being pinned. See `_DISCOVER_TURNSTILE_ASSET`.
+# solve time instead of being pinned. See `_WALK_TURNSTILE_ASSET`.
 _PINNED_ASSET = "/unauth-mweb/assets/turnstile-DykPLDEM.js"
-_DISCOVER_TURNSTILE_ASSET = """
-() => {
-  const pattern = /\\/turnstile-[^/"']+\\.js/;
-  const seen = [];
-  const push = (url) => { if (url && pattern.test(url) && !seen.includes(url)) seen.push(url); };
-  try { performance.getEntriesByType('resource').forEach((e) => push(e.name)); } catch (err) {}
-  try { Array.from(document.scripts).forEach((s) => push(s.src)); } catch (err) {}
-  return seen;
-}
-"""
-_SCAN_ASSET_IN_SCRIPTS = """
-async (pattern) => {
-  const re = new RegExp(pattern);
-  for (const script of Array.from(document.scripts)) {
-    if (!script.src) continue;
+_WALK_TURNSTILE_ASSET = """
+async (maxChunks) => {
+  // Match the module specifier and resolve it against the chunk that declares it —
+  // the raw path in the bundle is relative ("./turnstile-<hash>.js") and would
+  // otherwise be resolved against the wrong base.
+  const target = /["'`]((?:\\.{0,2}\\/)?[A-Za-z0-9_./-]*\\/turnstile-[A-Za-z0-9_-]+\\.js)["'`]/;
+  const specifier = /["'`]((?:\\.{0,2}\\/)?[A-Za-z0-9_./-]+\\.js)["'`]/g;
+  const seen = new Set();
+  const queue = [];
+  const push = (url) => {
+    if (!url || seen.has(url) || !url.startsWith(location.origin)) return;
+    seen.add(url);
+    queue.push(url);
+  };
+  // The turnstile chunk hangs off the sentinel subsystem, and a plain breadth-first
+  // walk drowns in unrelated chunks first, so prefer sentinel-shaped URLs. This only
+  // reorders the search: if nothing matches, the full walk still runs.
+  const preferred = /sentinel|prewarm|turnstile/i;
+  const shift = () => {
+    const index = queue.findIndex((url) => preferred.test(url));
+    return queue.splice(index === -1 ? 0 : index, 1)[0];
+  };
+  document.querySelectorAll('script[src], link[href]').forEach((node) => {
+    const raw = node.src || node.href;
+    if (raw && raw.split('?')[0].endsWith('.js')) push(new URL(raw, location.href).href);
+  });
+  // The document names most chunks through preload links rather than script tags, and
+  // the live DOM can be missing some of them, so also read the raw HTML for both.
+  try {
+    const html = await (await fetch(location.href)).text();
+    const refs = /(?:src|href)=["']([^"']+\\.js)["']/g;
+    let ref;
+    while ((ref = refs.exec(html)) !== null) push(new URL(ref[1], location.href).href);
+  } catch (error) {}
+  let fetched = 0;
+  while (queue.length && fetched < maxChunks) {
+    const url = shift();
+    fetched++;
+    let text;
     try {
-      const text = await (await fetch(script.src)).text();
-      const hit = text.match(re);
-      if (hit) return hit[0];
-    } catch (err) {}
+      text = await (await fetch(url)).text();
+    } catch (error) {
+      continue;
+    }
+    const hit = text.match(target);
+    if (hit) return { asset: new URL(hit[1], url).pathname, scanned: fetched };
+    let match;
+    specifier.lastIndex = 0;
+    while ((match = specifier.exec(text)) !== null) {
+      push(new URL(match[1], url).href);
+    }
   }
-  return null;
+  return { asset: null, scanned: fetched };
 }
 """
 _SOLVE_VIA_SDK = """
@@ -135,6 +166,7 @@ HEADLESS = os.getenv("SENTINEL_SOLVER_HEADLESS", "true").strip().lower() not in 
 # The ported VM inside vm.js keeps the frontend's own 500ms turnstile budget and
 # 60s SO budget. The page's own module may need to fetch/parse on first use, so it
 # gets room here.
+ASSET_WALK_MAX_CHUNKS = 80
 SDK_SOLVE_TIMEOUT_MS = 120000
 SDK_SOLVE_ATTEMPTS = 3
 READY_TIMEOUT_SECONDS = 60
@@ -276,23 +308,21 @@ class _Lane:
     async def turnstile_asset(self) -> str:
         """Locate chatgpt.com's own turnstile chunk.
 
-        The file name is content-hashed and changes on every deploy, so look for
-        the URL that is actually loaded on this page first, then scan the page's
-        own scripts for the literal path. The pinned path is only a last resort.
+        The file name is content-hashed and changes on every deploy, so walk the
+        page's module graph for it. The pinned path is only a last resort, and the
+        import that follows will fail loudly if it has gone stale.
         """
         if self._turnstile_asset:
             return self._turnstile_asset
         try:
-            loaded = await self.evaluate(_DISCOVER_TURNSTILE_ASSET, None)
-            if loaded:
-                self._turnstile_asset = str(loaded[0])
-                print(f"[sentinel-solver] turnstile asset (loaded): {self._turnstile_asset}", flush=True)
+            found = await self.evaluate(_WALK_TURNSTILE_ASSET, ASSET_WALK_MAX_CHUNKS) or {}
+            asset = str((found or {}).get("asset") or "")
+            scanned = (found or {}).get("scanned")
+            if asset:
+                self._turnstile_asset = asset
+                print(f"[sentinel-solver] turnstile asset discovered: {asset} (after {scanned} chunks)", flush=True)
                 return self._turnstile_asset
-            scanned = await self.evaluate(_SCAN_ASSET_IN_SCRIPTS, r"/unauth-mweb/assets/turnstile-[A-Za-z0-9_-]+\.js")
-            if scanned:
-                self._turnstile_asset = str(scanned)
-                print(f"[sentinel-solver] turnstile asset (scanned): {self._turnstile_asset}", flush=True)
-                return self._turnstile_asset
+            print(f"[sentinel-solver] turnstile asset not referenced in {scanned} chunks", flush=True)
         except Exception as exc:  # noqa: BLE001
             self.last_error = str(exc)
         print(f"[sentinel-solver] turnstile asset discovery fell back to {_PINNED_ASSET}", flush=True)
