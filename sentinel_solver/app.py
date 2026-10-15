@@ -36,6 +36,8 @@ from playwright.async_api import Browser, BrowserContext, Page, Playwright, asyn
 from playwright_stealth import Stealth
 from pydantic import BaseModel
 
+from turnstile_result import is_retryable_solve_error, validate_turnstile_token
+
 CHATGPT_URL = "https://chatgpt.com/"
 CHALLENGE_TITLES = ("请稍候", "Just a moment", "Attention Required")
 VM_SCRIPT = (Path(__file__).parent / "vm.js").read_text(encoding="utf-8")
@@ -83,17 +85,21 @@ async ([requirements, key, asset]) => {
     if (!turnstile || typeof turnstile.getEnforcementToken !== 'function') {
       return 'ERR:getEnforcementToken missing';
     }
-    // The SDK looks its seed up in a WeakMap keyed by the requirements object;
-    // hand it the p token instead.
+    // The seed map and token cache share the requirements key. Leave the cache
+    // untouched, or the SDK returns the seed without running the challenge.
+    const cache = turnstile.tokenCache;
     const original = WeakMap.prototype.get;
     WeakMap.prototype.get = function (target) {
+      if (this === cache) return original.call(this, target);
       return target === requirements ? key : original.call(this, target);
     };
+    let token;
     try {
-      return String(await turnstile.getEnforcementToken(requirements));
+      token = await turnstile.getEnforcementToken(requirements);
     } finally {
       WeakMap.prototype.get = original;
     }
+    return String(token === undefined || token === null ? '' : token);
   } catch (error) {
     return 'ERR:' + String(error).slice(0, 300);
   }
@@ -113,6 +119,7 @@ HEADLESS = os.getenv("SENTINEL_SOLVER_HEADLESS", "true").strip().lower() not in 
 # 60s SO budget. The page's own module may need to fetch/parse on first use, so it
 # gets room here.
 SDK_SOLVE_TIMEOUT_MS = 120000
+SDK_SOLVE_ATTEMPTS = 3
 READY_TIMEOUT_SECONDS = 60
 
 
@@ -257,15 +264,26 @@ class SolverPage:
     async def solve_turnstile(self, requirements: dict[str, Any] | None, dx: str, p: str) -> tuple[bool, str]:
         """Solve via the page's own turnstile module, falling back to the ported VM."""
         if requirements:
-            asset = await self.turnstile_asset()
-            try:
-                result = str(await self.evaluate(_SOLVE_VIA_SDK, [requirements, p, asset]) or "")
-            except Exception as exc:  # noqa: BLE001
-                result = f"ERR:{exc}"
-            if result and not result.startswith("ERR:"):
-                return True, result
-            self.last_error = result[:300]
-            print(f"[sentinel-solver] SDK solve failed via {asset}: {result[:300]}", flush=True)
+            error = ""
+            for attempt in range(1, SDK_SOLVE_ATTEMPTS + 1):
+                asset = await self.turnstile_asset()
+                try:
+                    raw = str(await self.evaluate(_SOLVE_VIA_SDK, [requirements, p, asset]) or "")
+                except Exception as exc:  # noqa: BLE001
+                    error = str(exc)
+                    break
+                if raw.startswith("ERR:"):
+                    error = raw[4:]
+                    break
+                error = validate_turnstile_token(raw, p)
+                if not error:
+                    return True, raw
+                # Retry only the frontend's cold-page VM timeout, on the warm page.
+                if not is_retryable_solve_error(error) or attempt == SDK_SOLVE_ATTEMPTS:
+                    break
+                print(f"[sentinel-solver] {error} (attempt {attempt}/{SDK_SOLVE_ATTEMPTS})", flush=True)
+            self.last_error = error[:300]
+            print(f"[sentinel-solver] SDK solve failed: {error[:300]}", flush=True)
             # Drop the cached asset and page so the next attempt re-discovers both.
             self._turnstile_asset = ""
             await self.invalidate()
@@ -274,7 +292,8 @@ class SolverPage:
         result = str(await self.evaluate(_SOLVE_VIA_VM, [dx, p]) or "")
         if result.startswith("ERR:"):
             return False, result[4:]
-        return bool(result), result
+        error = validate_turnstile_token(result, p)
+        return (False, error) if error else (True, result)
 
     async def evaluate(self, expression: str, arg: object) -> object:
         """Run in the page, reopening once if the page turned out to be dead."""

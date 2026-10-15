@@ -18,7 +18,7 @@ COPY requirements.txt ./
 # 只安装完整 Chromium（新版无头模式），headless shell 过不了 Cloudflare
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py vm.js entrypoint.sh ./
+COPY app.py turnstile_result.py vm.js entrypoint.sh ./
 
 EXPOSE 8080
 ENTRYPOINT ["/app/entrypoint.sh"]
