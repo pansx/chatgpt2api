@@ -2,7 +2,7 @@ name: chatgpt2api
 
 services:
   app:
-    image: pansx/chatgpt2api:sentinel-2026-10-cf-retry
+    image: pansx/chatgpt2api:sentinel-2026-10-browser
     restart: unless-stopped
     ports:
       - "8000:80"
@@ -37,7 +37,7 @@ services:
         condition: service_healthy
 
   sentinel-solver:
-    image: pansx/chatgpt2api-sentinel-solver:sentinel-2026-10-cf-retry
+    image: pansx/chatgpt2api-sentinel-solver:sentinel-2026-10-browser
     restart: unless-stopped
     environment:
       SENTINEL_SOLVER_KEY: ${SENTINEL_SOLVER_KEY:-}
