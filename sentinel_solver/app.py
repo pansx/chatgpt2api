@@ -29,6 +29,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException
@@ -106,6 +107,20 @@ async ([requirements, key, asset]) => {
 }
 """
 _SOLVE_VIA_VM = "([dx, p]) => window.__sentinelVM.turnstile(dx, p)"
+_BROWSER_FETCH = """
+async ([method, url, headers, body]) => {
+  try {
+    const resp = await fetch(url, { method, headers: headers || {}, body: body || undefined,
+                                   redirect: 'error', signal: AbortSignal.timeout(30000) });
+    const text = await resp.text();
+    const out = {};
+    resp.headers.forEach((value, key) => { out[key] = value; });
+    return { status: resp.status, headers: out, text };
+  } catch (error) {
+    return { status: 0, headers: {}, text: 'ERR:' + String(error).slice(0, 400) };
+  }
+}
+"""
 
 SOLVER_KEY = os.getenv("SENTINEL_SOLVER_KEY", "").strip()
 PROXY = os.getenv("SENTINEL_SOLVER_PROXY", "").strip()
@@ -133,6 +148,7 @@ class SolverPage:
         self._page: Page | None = None
         self._opened_at = 0.0
         self._lock = asyncio.Lock()
+        self._request_lock = asyncio.Lock()
         self._turnstile_asset = ""
         self.user_agent = USER_AGENT
         self.last_error = ""
@@ -347,6 +363,13 @@ class SORequest(BaseModel):
     p: str
 
 
+class BrowserRequest(BaseModel):
+    method: str = "GET"
+    url: str = ""
+    headers: dict[str, str] = {}
+    body: str = ""
+
+
 def require_key(authorization: str | None) -> None:
     if not SOLVER_KEY:
         return
@@ -370,6 +393,44 @@ async def solve_turnstile(body: TurnstileRequest, authorization: str | None = He
     if not ok:
         raise HTTPException(status_code=503, detail=f"turnstile solve failed: {token[:300]}")
     return {"token": token}
+
+
+@app.post("/v1/request")
+async def browser_request(body: BrowserRequest, authorization: str | None = Header(default=None)) -> dict[str, object]:
+    require_key(authorization)
+    target = urlsplit(body.url)
+    routes = {
+        "/backend-api/me": "GET",
+        "/backend-api/conversation/init": "POST",
+        "/backend-api/accounts/check/v4-2023-04-27": "GET",
+        **{f"/{base}/sentinel/chat-requirements/{step}": "POST"
+           for base in ("backend-api", "backend-anon") for step in ("prepare", "finalize")},
+    }
+    if (target.scheme != "https" or target.netloc != "chatgpt.com" or target.fragment
+            or routes.get(target.path) != body.method.upper()):
+        raise HTTPException(status_code=400, detail="browser request URL is not allowed")
+    forbidden = {
+        "user-agent", "cookie", "cookie2", "origin", "referer", "host", "content-length",
+        "connection", "keep-alive", "te", "trailer", "transfer-encoding", "upgrade", "via",
+        "date", "expect", "dnt", "accept", "accept-language", "accept-charset", "accept-encoding",
+    }
+    prefix_forbidden = ("sec-", "proxy-", "access-control-")
+    headers = {}
+    for key, value in (body.headers or {}).items():
+        name = str(key or "").strip().lower()
+        if name and name not in forbidden and not name.startswith(prefix_forbidden):
+            headers[str(key)] = str(value)
+    try:
+        async with solver._request_lock:
+            try:
+                result = await solver.evaluate(_BROWSER_FETCH, [body.method.upper(), body.url, headers, body.body])
+            finally:
+                # finalize 的限制 Cookie 不能留给下一次浏览器请求。
+                if solver._context is not None:
+                    await solver._context.clear_cookies(name="oai-sc")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"browser request failed: {exc}") from exc
+    return result if isinstance(result, dict) else {"status": 0, "headers": {}, "text": str(result)}
 
 
 @app.post("/v1/so")

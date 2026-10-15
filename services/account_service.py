@@ -1352,21 +1352,13 @@ class AccountService:
 
         active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
         try:
-            from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
-            backend = OpenAIBackendAPI(active_token)
-            try:
-                result = backend.get_user_info()
-            finally:
-                backend.close()
+            from services.openai_backend_api import InvalidAccessTokenError
+            result = self._fetch_user_info_with_challenge_retry(active_token)
         except InvalidAccessTokenError as exc:
             refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
             if refreshed_token and refreshed_token != active_token:
                 try:
-                    backend = OpenAIBackendAPI(refreshed_token)
-                    try:
-                        result = backend.get_user_info()
-                    finally:
-                        backend.close()
+                    result = self._fetch_user_info_with_challenge_retry(refreshed_token)
                 except InvalidAccessTokenError as retry_exc:
                     if self._record_invalid_token_seen(
                         refreshed_token,
@@ -1388,6 +1380,21 @@ class AccountService:
                 raise
         self._record_refresh_success(active_token)
         return self.update_account(active_token, result)
+
+    @staticmethod
+    def _fetch_user_info_with_challenge_retry(access_token: str) -> dict[str, Any]:
+        """短暂挑战不代表账号失效；跨挑战窗口重试，并及时释放会话。"""
+        from services.openai_backend_api import CloudflareChallengeError, OpenAIBackendAPI
+
+        for attempt in range(3):
+            try:
+                with OpenAIBackendAPI(access_token) as backend:
+                    return backend.get_user_info()
+            except CloudflareChallengeError:
+                if attempt == 2:
+                    raise
+                time.sleep(20 * (attempt + 1))
+        raise RuntimeError("unreachable")
 
     # ---- 刷新进度追踪 ----
 
