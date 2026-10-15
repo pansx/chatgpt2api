@@ -181,7 +181,8 @@ class SentinelHandshakeTests(unittest.TestCase):
             for call in (first, second):
                 self.assertEqual(call.kwargs["json"]["model"], "auto")
                 self.assertEqual(call.kwargs["json"]["parent_message_id"], "client-created-root")
-                self.assertNotIn("X-OpenAI-Target-Path", call.kwargs["headers"])
+                self.assertEqual(call.kwargs["headers"]["X-OpenAI-Target-Path"],
+                                 call.kwargs["headers"]["X-OpenAI-Target-Route"])
                 self.assertEqual(call.kwargs["headers"]["OpenAI-Sentinel-Turnstile-Token"], "turnstile")
             message = second.kwargs["json"]["messages"][0]
             self.assertEqual(message["content"]["parts"][-1], "@创建图像 cat")

@@ -273,9 +273,9 @@ class OpenAIBackendAPI:
         return fp
 
     def _headers(self, path: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-        """构造请求头，并补上 web 端要求的 target route。"""
+        """构造请求头，并补上 web 端要求的 target path/route。"""
         headers = dict(self.session.headers)
-        # 同时发送 Target-Path 和 Target-Route 会间歇触发 Cloudflare 403 挑战页。
+        headers["X-OpenAI-Target-Path"] = path
         headers["X-OpenAI-Target-Route"] = path
         if extra:
             headers.update(extra)
@@ -293,25 +293,52 @@ class OpenAIBackendAPI:
             raise InvalidAccessTokenError(f"token invalidated ({path})")
         raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
 
+    @staticmethod
+    def _is_cloudflare_challenge(response: requests.Response) -> bool:
+        """仅识别 Cloudflare 挑战页，JSON 403 仍按授权拒绝处理。"""
+        if response.status_code != 403:
+            return False
+        content_type = str(response.headers.get("content-type") or "").lower()
+        if "json" in content_type:
+            return False
+        return (
+            str(response.headers.get("cf-mitigated") or "").strip().lower() == "challenge"
+            or "text/html" in content_type
+        )
+
+    def _retry_cloudflare_challenge(self, request: Callable[[], requests.Response]) -> requests.Response:
+        """账号刷新遇到临时挑战时最多尝试三次，避免健康账号被误判为无额度。"""
+        response = request()
+        for attempt in range(1, 3):
+            if not self._is_cloudflare_challenge(response):
+                return response
+            time.sleep(1.5 * attempt)
+            response = request()
+        return response
+
     def _get_me(self) -> Dict[str, Any]:
         path = "/backend-api/me"
-        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
+        response = self._retry_cloudflare_challenge(
+            lambda: self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
+        )
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()
 
     def _get_conversation_init(self) -> Dict[str, Any]:
         path = "/backend-api/conversation/init"
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._headers(path, {"Content-Type": "application/json"}),
-            json={
-                "gizmo_id": None,
-                "requested_default_model": None,
-                "conversation_id": None,
-                "timezone_offset_min": -480,
-            },
-            timeout=20,
+        response = self._retry_cloudflare_challenge(
+            lambda: self.session.post(
+                self.base_url + path,
+                headers=self._headers(path, {"Content-Type": "application/json"}),
+                json={
+                    "gizmo_id": None,
+                    "requested_default_model": None,
+                    "conversation_id": None,
+                    "timezone_offset_min": -480,
+                },
+                timeout=20,
+            )
         )
         if response.status_code != 200:
             self._raise_on_error(response, path)
@@ -319,8 +346,10 @@ class OpenAIBackendAPI:
 
     def _get_default_account(self) -> Dict[str, Any]:
         path = "/backend-api/accounts/check/v4-2023-04-27"
-        response = self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
-                                    timeout=20)
+        response = self._retry_cloudflare_challenge(
+            lambda: self.session.get(self.base_url + path + "?timezone_offset_min=-480",
+                                     headers=self._headers(path), timeout=20)
+        )
         if response.status_code != 200:
             self._raise_on_error(response, path)
         payload = response.json()
