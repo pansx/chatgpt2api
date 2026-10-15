@@ -22,6 +22,7 @@ docker-compose-local.yml
 .env.local
 .codex/compose*
 .codex/clash.yaml
+script/compose-prepare.py
 
 # Database files
 *.db
