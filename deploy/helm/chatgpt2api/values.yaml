@@ -1,7 +1,7 @@
 authKey: ""
-image: pansx/chatgpt2api:sentinel-2026-10-browser
+image: pansx/chatgpt2api:sentinel-2026-10-identity
 solver:
-  image: pansx/chatgpt2api-sentinel-solver:sentinel-2026-10-browser
+  image: pansx/chatgpt2api-sentinel-solver:sentinel-2026-10-identity
   proxy: ""
   downloadProxy: ""
   resources: {}

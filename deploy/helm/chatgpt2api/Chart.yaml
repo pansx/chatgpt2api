@@ -2,5 +2,5 @@ apiVersion: v2
 name: chatgpt2api
 description: ChatGPT API with automatic sentinel solver configuration
 type: application
-version: 0.1.3
-appVersion: "sentinel-2026-10-browser"
+version: 0.1.4
+appVersion: "sentinel-2026-10-identity"

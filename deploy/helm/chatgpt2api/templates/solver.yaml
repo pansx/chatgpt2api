@@ -29,6 +29,10 @@ spec:
                 secretKeyRef:
                   name: {{ include "c.name" . }}
                   key: solver-key
+            # The solver page must declare the same timezone as the main service's
+            # payloads (utils/identity.py); a mismatch is what the handshake scores on.
+            - name: SENTINEL_SOLVER_TIMEZONE
+              value: America/Los_Angeles
             {{- with (.Values.solver.proxy | default .Values.proxy) }}
             - name: SENTINEL_SOLVER_PROXY
               value: {{ . | quote }}
