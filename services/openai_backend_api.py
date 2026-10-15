@@ -26,6 +26,7 @@ from services.proxy_service import proxy_settings
 from services.proxy_pool_service import account_route_key, proxy_pool
 from services.sentinel_solver_client import SentinelSolverError, browser_request, solve_turnstile, solver_user_agent
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.identity import IDENTITY_TIMEZONE, identity_timezone_offset_min
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 
@@ -419,7 +420,7 @@ class OpenAIBackendAPI:
             "gizmo_id": None,
             "requested_default_model": None,
             "conversation_id": None,
-            "timezone_offset_min": -480,
+            "timezone_offset_min": identity_timezone_offset_min(),
         })
         if response.status_code != 200:
             self._raise_on_error(response, path)
@@ -427,7 +428,7 @@ class OpenAIBackendAPI:
 
     def _get_default_account(self) -> Dict[str, Any]:
         path = "/backend-api/accounts/check/v4-2023-04-27"
-        response = self._json_request("GET", path + "?timezone_offset_min=-480")
+        response = self._json_request("GET", path + f"?timezone_offset_min={identity_timezone_offset_min()}")
         if response.status_code != 200:
             self._raise_on_error(response, path)
         payload = response.json()
@@ -659,7 +660,7 @@ class OpenAIBackendAPI:
             "supported_encodings": [],
             "system_hints": [],
             "timezone": timezone,
-            "timezone_offset_min": -480,
+            "timezone_offset_min": identity_timezone_offset_min(),
             "variant_purpose": "comparison_implicit",
             "websocket_request_id": new_uuid(),
             "client_contextual_info": {
@@ -987,8 +988,8 @@ class OpenAIBackendAPI:
             "model": self._image_model_settings(model)[0],
             "parent_message_id": CLIENT_CREATED_ROOT,
             "system_hints": ["picture_v2"],
-            "timezone": "Asia/Shanghai",
-            "timezone_offset_min": -480,
+            "timezone": IDENTITY_TIMEZONE,
+            "timezone_offset_min": identity_timezone_offset_min(),
             "client_contextual_info": {
                 "app_name": "chatgpt.com",
                 "app_surface": "codex_browser",
@@ -1154,8 +1155,8 @@ class OpenAIBackendAPI:
             "parent_message_id": CLIENT_CREATED_ROOT,
             "model": self._image_model_settings(model)[0],
             "system_hints": ["picture_v2"],
-            "timezone_offset_min": -480,
-            "timezone": "Asia/Shanghai",
+            "timezone_offset_min": identity_timezone_offset_min(),
+            "timezone": IDENTITY_TIMEZONE,
             "client_contextual_info": {
                 "app_name": "chatgpt.com",
                 "app_surface": "codex_browser",
@@ -1403,7 +1404,7 @@ class OpenAIBackendAPI:
                 "file_name": file_name,
                 "file_size": len(data),
                 "use_case": "multimodal",
-                "timezone_offset_min": -480,
+                "timezone_offset_min": identity_timezone_offset_min(),
                 "reset_rate_limits": False,
                 "store_in_library": True,
                 "library_persistence_mode": "opportunistic",
@@ -1476,8 +1477,8 @@ class OpenAIBackendAPI:
             "parent_message_id": "client-created-root",
             "model": EDITABLE_FILE_MODEL,
             "client_prepare_state": "success",
-            "timezone_offset_min": -480,
-            "timezone": "Asia/Shanghai",
+            "timezone_offset_min": identity_timezone_offset_min(),
+            "timezone": IDENTITY_TIMEZONE,
             "conversation_mode": {"kind": "primary_assistant"},
             "system_hints": [],
             "partial_query": {"id": new_uuid(), "author": {"role": "user"}, "content": {"content_type": "text", "parts": [prompt]}},
@@ -1544,8 +1545,8 @@ class OpenAIBackendAPI:
                 "parent_message_id": "client-created-root",
                 "model": EDITABLE_FILE_MODEL,
                 "client_prepare_state": "sent",
-                "timezone_offset_min": -480,
-                "timezone": "Asia/Shanghai",
+                "timezone_offset_min": identity_timezone_offset_min(),
+                "timezone": IDENTITY_TIMEZONE,
                 "conversation_mode": {"kind": "primary_assistant"},
                 "enable_message_followups": True,
                 "system_hints": [],
@@ -1974,8 +1975,8 @@ class OpenAIBackendAPI:
                 "parent_message_id": "client-created-root",
                 "model": model,
                 "client_prepare_state": "success",
-                "timezone_offset_min": -480,
-                "timezone": "Asia/Shanghai",
+                "timezone_offset_min": identity_timezone_offset_min(),
+                "timezone": IDENTITY_TIMEZONE,
                 "conversation_mode": {"kind": "primary_assistant"},
                 "system_hints": ["search"],
                 "partial_query": {"id": new_uuid(), "author": {"role": "user"}, "content": {"content_type": "text", "parts": [prompt]}},
@@ -2015,8 +2016,8 @@ class OpenAIBackendAPI:
                 "parent_message_id": "client-created-root",
                 "model": model,
                 "client_prepare_state": "success",
-                "timezone_offset_min": -480,
-                "timezone": "Asia/Shanghai",
+                "timezone_offset_min": identity_timezone_offset_min(),
+                "timezone": IDENTITY_TIMEZONE,
                 "conversation_mode": {"kind": "primary_assistant"},
                 "enable_message_followups": True,
                 "system_hints": [],
@@ -2859,8 +2860,8 @@ class OpenAIBackendAPI:
 
     def _chat_target(self) -> tuple[str, str]:
         if self.access_token:
-            return "/backend-api/conversation", "Asia/Shanghai"
-        return "/backend-anon/conversation", "America/Los_Angeles"
+            return "/backend-api/conversation", IDENTITY_TIMEZONE
+        return "/backend-anon/conversation", IDENTITY_TIMEZONE
 
     def list_models(self) -> Dict[str, Any]:
         """返回当前模式下可用模型，格式对齐 OpenAI `/v1/models`。"""

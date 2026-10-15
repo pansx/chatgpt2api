@@ -2,7 +2,6 @@ import json
 import random
 import re
 import time
-from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any, Sequence
 
@@ -10,6 +9,7 @@ import pybase64
 
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 from utils.helper import new_uuid
+from utils.identity import identity_pow_date_string
 
 
 CORES = [8, 16, 24, 32]
@@ -53,11 +53,6 @@ def parse_pow_resources(html_content: str) -> tuple[list[str], str]:
         if match:
             data_build = match.group(1)
     return script_sources, data_build
-
-
-def _legacy_parse_time() -> str:
-    now = datetime.now(timezone(timedelta(hours=-5)))
-    return now.strftime("%a %b %d %Y %H:%M:%S") + " GMT-0500 (Eastern Standard Time)"
 
 
 def build_pow_config(
@@ -149,7 +144,7 @@ def build_pow_config(
     script_source = random.choice(list(script_sources)) if script_sources else DEFAULT_POW_SCRIPT
     return [
         sum(random.choices(SCREEN_RESOLUTIONS, k=1)[0]),
-        _legacy_parse_time(),
+        identity_pow_date_string(),
         4294705152,
         1,
         user_agent,

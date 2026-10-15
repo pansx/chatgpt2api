@@ -38,7 +38,7 @@ services:
       HTTP_PROXY: http://host.docker.internal:7072
       HTTPS_PROXY: http://host.docker.internal:7072
       NO_PROXY: localhost,127.0.0.1,app,solver,host.docker.internal
-      SENTINEL_SOLVER_TIMEZONE: ${SENTINEL_SOLVER_TIMEZONE:-Asia/Shanghai}
+      SENTINEL_SOLVER_TIMEZONE: ${SENTINEL_SOLVER_TIMEZONE:-America/Los_Angeles}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     shm_size: 1gb
