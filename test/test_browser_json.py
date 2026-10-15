@@ -145,8 +145,11 @@ class BrowserEndpointTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_headers_filtered_and_restricted_cookie_cleared(self):
         module = self.module
-        solver = mock.Mock(_request_lock=asyncio.Lock(), evaluate=mock.AsyncMock(return_value={"status": 200}))
-        solver._context.clear_cookies = mock.AsyncMock()
+        solver = module.SolverPage()
+        lane = module._Lane(solver, "test", {})
+        lane.evaluate = mock.AsyncMock(return_value={"status": 200})
+        lane._context = mock.Mock(clear_cookies=mock.AsyncMock())
+        solver._lane = mock.AsyncMock(return_value=lane)
         request = module.BrowserRequest(method="POST", url="https://chatgpt.com/backend-api/sentinel/chat-requirements/finalize",
                                         headers={"Cookie": "private", "Sec-Ch-Ua": "bad", "User-Agent": "bad",
                                                  "Origin": "bad", "Proxy-Authorization": "bad",
@@ -154,9 +157,9 @@ class BrowserEndpointTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(module, "solver", solver), mock.patch.object(module, "SOLVER_KEY", "secret"):
             result = await module.browser_request(request, "Bearer secret")
         self.assertEqual(result, {"status": 200})
-        self.assertEqual(solver.evaluate.call_args.args[1][2], {
+        self.assertEqual(lane.evaluate.call_args.args[1][2], {
             "Authorization": "Bearer account", "Content-Type": "application/json"})
-        solver._context.clear_cookies.assert_awaited_once_with(name="oai-sc")
+        lane._context.clear_cookies.assert_awaited_once_with(name="oai-sc")
 
     async def test_auth_and_route_limits_prevent_fetch(self):
         module = self.module

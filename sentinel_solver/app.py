@@ -23,6 +23,8 @@ Environment:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import hmac
 import os
 import time
@@ -138,53 +140,74 @@ SDK_SOLVE_ATTEMPTS = 3
 READY_TIMEOUT_SECONDS = 60
 
 
-class SolverPage:
-    """Keeps one Cloudflare-cleared chatgpt.com page alive, reopening it when it goes stale."""
+# Per-exit lanes: one browser context per pool exit so the challenge is solved from the
+# same IP the business request uses. LRU-capped, idle-reaped.
+MAX_LANES = max(0, int(os.getenv("SENTINEL_SOLVER_MAX_LANES", "8")))
+LANE_IDLE_SECS = max(60, int(os.getenv("SENTINEL_SOLVER_LANE_IDLE_SECS", "1800")))
+# Playwright's per-context proxy takes server + optional username/password and handles
+# proxy auth itself, so an authenticated exit needs no local relay.
+_PROXY_SCHEME_MAP = {"socks5h": "socks5", "https": "http"}
 
-    def __init__(self) -> None:
-        self._playwright: Playwright | None = None
-        self._browser: Browser | None = None
+
+def _lane_proxy_spec(proxy: str) -> dict[str, str]:
+    """Turn a pool proxy URL into Playwright's per-context proxy argument.
+
+    Playwright accepts ``{server, username, password}`` natively, so anonymous and
+    authenticated exits both collapse to one dict. The returned ``server`` is the
+    stable lane key.
+    """
+    raw = str(proxy or "").strip()
+    if not raw:
+        return {}
+    if "://" not in raw:
+        raw = "http://" + raw
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(raw)
+    scheme = (parts.scheme or "http").lower()
+    host = parts.hostname or ""
+    if not host:
+        return {}
+    host = f"[{host}]" if ":" in host else host
+    netloc = f"{host}:{parts.port}" if parts.port else host
+    spec = {"server": f"{_PROXY_SCHEME_MAP.get(scheme, scheme)}://{netloc}"}
+    if parts.username:
+        from urllib.parse import unquote
+        spec["username"] = unquote(parts.username)
+        spec["password"] = unquote(parts.password or "")
+    return spec
+class _Lane:
+    """One Cloudflare-cleared chatgpt.com page bound to one egress proxy.
+
+    The challenge program ties its proof to the browser context that solved it, so each
+    pool exit gets its own context; the empty-key lane is the default egress.
+    """
+
+    def __init__(self, solver: "SolverPage", key: str, proxy_spec: dict[str, str]) -> None:
+        self._solver = solver
+        self.key = key
+        self.proxy_spec = proxy_spec
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._opened_at = 0.0
         self._lock = asyncio.Lock()
         self._request_lock = asyncio.Lock()
         self._turnstile_asset = ""
-        self.user_agent = USER_AGENT
         self.last_error = ""
+        self.last_used = time.monotonic()
 
-    async def start(self) -> None:
-        self._playwright = await async_playwright().start()
-        launch_kwargs = {
-            "headless": HEADLESS,
-            # channel="chromium" uses full Chromium's new headless mode; the default
-            # headless shell cannot clear the Cloudflare challenge.
-            "channel": "chromium",
-            "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
-        }
-        if PROXY:
-            launch_kwargs["proxy"] = {"server": PROXY}
-        self._browser = await self._playwright.chromium.launch(**launch_kwargs)
-        if not self.user_agent:
-            major = self._browser.version.split(".")[0]
-            self.user_agent = (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
-            )
-        try:
-            await self.page()
-        except Exception as exc:  # noqa: BLE001
-            # A page that cannot open yet is not fatal; the first request retries.
-            self.last_error = str(exc)
-            print(f"[sentinel-solver] initial page open failed: {exc}", flush=True)
+    async def close(self) -> None:
+        async with self._lock:
+            await self._close_locked()
 
-    async def stop(self) -> None:
+    async def _close_locked(self) -> None:
         if self._context is not None:
-            await self._context.close()
-        if self._browser is not None:
-            await self._browser.close()
-        if self._playwright is not None:
-            await self._playwright.stop()
+            try:
+                await self._context.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._context = None
+        self._page = None
 
     async def page(self) -> Page:
         async with self._lock:
@@ -193,6 +216,7 @@ class SolverPage:
                 stale = True
             if stale:
                 await self._reopen()
+            self.last_used = time.monotonic()
             return self._page
 
     async def invalidate(self) -> None:
@@ -200,20 +224,17 @@ class SolverPage:
             self._opened_at = 0.0
 
     async def _reopen(self) -> None:
-        if self._context is not None:
-            try:
-                await self._context.close()
-            except Exception:  # noqa: BLE001
-                pass
-        self._page = None
+        await self._close_locked()
         context_kwargs: dict[str, object] = {
             "locale": "zh-CN",
             "viewport": {"width": 1280, "height": 800},
-            "user_agent": self.user_agent,
+            "user_agent": self._solver.user_agent,
         }
+        if self.proxy_spec:
+            context_kwargs["proxy"] = self.proxy_spec
         if TIMEZONE:
             context_kwargs["timezone_id"] = TIMEZONE
-        context = await self._browser.new_context(**context_kwargs)
+        context = await self._solver._browser.new_context(**context_kwargs)
         # page.evaluate has no per-call timeout, so widen the context default; the
         # page's own module can take a moment on first use.
         context.set_default_timeout(SDK_SOLVE_TIMEOUT_MS)
@@ -235,7 +256,8 @@ class SolverPage:
         self._page = page
         self._opened_at = time.monotonic()
         self.last_error = ""
-        print(f"[sentinel-solver] chatgpt.com page ready: {await page.title()!r}", flush=True)
+        label = f" (proxy={self.proxy_spec['server']})" if self.proxy_spec else ""
+        print(f"[sentinel-solver] chatgpt.com page ready{label}: {await page.title()!r}", flush=True)
 
     @staticmethod
     async def _is_ready(page: Page | None) -> bool:
@@ -294,7 +316,8 @@ class SolverPage:
                 error = validate_turnstile_token(raw, p)
                 if not error:
                     return True, raw
-                # Retry only the frontend's cold-page VM timeout, on the warm page.
+                # Only a cold-page timeout is worth retrying; anything else is a real
+                # failure and re-running it just wastes the caller's budget.
                 if not is_retryable_solve_error(error) or attempt == SDK_SOLVE_ATTEMPTS:
                     break
                 print(f"[sentinel-solver] {error} (attempt {attempt}/{SDK_SOLVE_ATTEMPTS})", flush=True)
@@ -311,6 +334,29 @@ class SolverPage:
         error = validate_turnstile_token(result, p)
         return (False, error) if error else (True, result)
 
+    async def clearance(self) -> dict[str, object]:
+        """Cookies the challenge-cleared page holds, plus the user agent that earned them.
+
+        Cloudflare binds its clearance to the client that solved the challenge, so the
+        caller has to replay both the cookies and this UA, from the same egress.
+        """
+        page = await self.page()
+        cookies = await self._context.cookies("https://chatgpt.com/")
+        return {
+            "user_agent": self._solver.user_agent,
+            "page_url": CHATGPT_URL,
+            "cookies": [
+                {
+                    "name": str(item.get("name") or ""),
+                    "value": str(item.get("value") or ""),
+                    "domain": str(item.get("domain") or ""),
+                    "path": str(item.get("path") or "/"),
+                }
+                for item in cookies
+                if item.get("name")
+            ],
+        }
+
     async def evaluate(self, expression: str, arg: object) -> object:
         """Run in the page, reopening once if the page turned out to be dead."""
         for attempt in range(2):
@@ -324,14 +370,144 @@ class SolverPage:
                 await self.invalidate()
         raise RuntimeError("unreachable")
 
+    async def browser_request(self, method: str, url: str, headers: dict[str, str], body: str) -> dict[str, object]:
+        """Run a same-origin request through the page so it carries the browser identity.
+
+        Headers that ``fetch`` forbids (Sec-*, User-Agent, Cookie, Origin, Referer,
+        Host, Content-Length, ...) are dropped here rather than passed to the browser;
+        those are owned by the page itself and a mismatch there is exactly what trips
+        the fingerprint check.
+        """
+        exact_forbidden = {
+            "user-agent", "cookie", "cookie2", "origin", "referer", "host",
+            "content-length", "connection", "keep-alive", "te", "trailer",
+            "transfer-encoding", "upgrade", "via", "date", "expect", "dnt",
+            "accept", "accept-language", "accept-charset", "accept-encoding",
+        }
+        prefix_forbidden = ("sec-", "proxy-", "access-control-")
+        allowed: dict[str, str] = {}
+        for key, value in (headers or {}).items():
+            name = str(key or "").strip().lower()
+            if not name or name in exact_forbidden or name.startswith(prefix_forbidden):
+                continue
+            allowed[key] = str(value)
+        async with self._request_lock:
+            try:
+                result = await self.evaluate(_BROWSER_FETCH, [method, url, allowed, body])
+            finally:
+                if self._context is not None:
+                    await self._context.clear_cookies(name="oai-sc")
+        return result if isinstance(result, dict) else {"status": 0, "headers": {}, "text": str(result)}
+
     def status(self) -> dict[str, object]:
         return {
             "ready": self._page is not None and not self._page.is_closed(),
+            "proxy": self.proxy_spec.get("server"),
             "page_age_seconds": int(time.monotonic() - self._opened_at) if self._opened_at else None,
+            "last_used_seconds_ago": int(time.monotonic() - self.last_used),
+            "last_error": self.last_error or None,
+        }
+
+
+class SolverPage:
+    """Keeps one Cloudflare-cleared chatgpt.com page per egress lane, reopening them when stale."""
+
+    def __init__(self) -> None:
+        self._playwright: Playwright | None = None
+        self._browser: Browser | None = None
+        self._lanes: dict[str, _Lane] = {}
+        self._lanes_lock = asyncio.Lock()
+        self.user_agent = USER_AGENT
+        self.last_error = ""
+
+    async def start(self) -> None:
+        self._playwright = await async_playwright().start()
+        launch_kwargs = {
+            "headless": HEADLESS,
+            # channel="chromium" uses full Chromium's new headless mode; the default
+            # headless shell cannot clear the Cloudflare challenge.
+            "channel": "chromium",
+            "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+        }
+        self._browser = await self._playwright.chromium.launch(**launch_kwargs)
+        if not self.user_agent:
+            major = self._browser.version.split(".")[0]
+            self.user_agent = (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+            )
+        try:
+            await (await self._lane("")).page()
+        except Exception as exc:  # noqa: BLE001
+            # A page that cannot open yet is not fatal; the first request retries.
+            self.last_error = str(exc)
+            print(f"[sentinel-solver] initial page open failed: {exc}", flush=True)
+
+    async def stop(self) -> None:
+        async with self._lanes_lock:
+            lanes = list(self._lanes.values())
+            self._lanes.clear()
+        for lane in lanes:
+            await lane.close()
+        if self._browser is not None:
+            await self._browser.close()
+        if self._playwright is not None:
+            await self._playwright.stop()
+
+    async def _lane(self, proxy: str) -> _Lane:
+        spec = _lane_proxy_spec(proxy)
+        key = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest() if spec else ""
+        now = time.monotonic()
+        to_close: list[_Lane] = []
+        async with self._lanes_lock:
+            for lane_key, lane in list(self._lanes.items()):
+                if lane_key and now - lane.last_used > LANE_IDLE_SECS:
+                    del self._lanes[lane_key]
+                    to_close.append(lane)
+            lane = self._lanes.get(key)
+            if lane is None:
+                if MAX_LANES and len(self._lanes) >= MAX_LANES:
+                    victim = min(
+                        (l for k, l in self._lanes.items() if k),
+                        key=lambda l: l.last_used,
+                        default=None,
+                    )
+                    if victim is not None:
+                        del self._lanes[victim.key]
+                        to_close.append(victim)
+                lane = _Lane(self, key, spec)
+                self._lanes[key] = lane
+        for stale in to_close:
+            await stale.close()
+        return lane
+
+    async def solve_turnstile(
+        self, requirements: dict[str, Any] | None, dx: str, p: str, proxy: str = ""
+    ) -> tuple[bool, str]:
+        lane = await self._lane(proxy)
+        async with lane._request_lock:
+            return await lane.solve_turnstile(requirements, dx, p)
+
+    async def clearance(self) -> dict[str, object]:
+        return await (await self._lane("")).clearance()
+
+    async def evaluate(self, expression: str, arg: object) -> object:
+        return await (await self._lane("")).evaluate(expression, arg)
+
+    async def browser_request(
+        self, method: str, url: str, headers: dict[str, str], body: str, proxy: str = ""
+    ) -> dict[str, object]:
+        lane = await self._lane(proxy)
+        return await lane.browser_request(method, url, headers, body)
+
+    def status(self) -> dict[str, object]:
+        return {
+            "ready": self._browser is not None,
             "browser_version": self._browser.version if self._browser else None,
             "user_agent": self.user_agent,
             "timezone": TIMEZONE or None,
             "last_error": self.last_error or None,
+            "lanes": {key: lane.status() for key, lane in self._lanes.items()},
         }
 
 
@@ -349,6 +525,7 @@ app = FastAPI(title="chatgpt2api sentinel solver", lifespan=lifespan)
 
 
 class TurnstileRequest(BaseModel):
+    proxy: str = ""
     p: str
     dx: str = ""
     # The full `/chat-requirements/prepare` response: pure challenge material
@@ -364,6 +541,7 @@ class SORequest(BaseModel):
 
 
 class BrowserRequest(BaseModel):
+    proxy: str = ""
     method: str = "GET"
     url: str = ""
     headers: dict[str, str] = {}
@@ -387,7 +565,7 @@ async def health() -> dict[str, object]:
 async def solve_turnstile(body: TurnstileRequest, authorization: str | None = Header(default=None)) -> dict[str, str]:
     require_key(authorization)
     try:
-        ok, token = await solver.solve_turnstile(body.requirements, body.dx, body.p)
+        ok, token = await solver.solve_turnstile(body.requirements, body.dx, body.p, body.proxy)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=f"turnstile solve failed: {exc}") from exc
     if not ok:
@@ -421,13 +599,7 @@ async def browser_request(body: BrowserRequest, authorization: str | None = Head
         if name and name not in forbidden and not name.startswith(prefix_forbidden):
             headers[str(key)] = str(value)
     try:
-        async with solver._request_lock:
-            try:
-                result = await solver.evaluate(_BROWSER_FETCH, [body.method.upper(), body.url, headers, body.body])
-            finally:
-                # finalize 的限制 Cookie 不能留给下一次浏览器请求。
-                if solver._context is not None:
-                    await solver._context.clear_cookies(name="oai-sc")
+        result = await solver.browser_request(body.method.upper(), body.url, headers, body.body, body.proxy)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=f"browser request failed: {exc}") from exc
     return result if isinstance(result, dict) else {"status": 0, "headers": {}, "text": str(result)}

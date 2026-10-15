@@ -12,6 +12,7 @@ import urllib.request
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from collections.abc import Callable
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import unquote, urlparse
@@ -22,6 +23,7 @@ from PIL import Image
 from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
+from services.proxy_pool_service import account_route_key, proxy_pool
 from services.sentinel_solver_client import SentinelSolverError, browser_request, solve_turnstile, solver_user_agent
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
@@ -193,6 +195,27 @@ class OpenAIBackendAPI:
     - 协议兼容转换放在 `services.protocol`
     """
 
+    def _egress_profile(self) -> tuple[str, str]:
+        """Resolve this account's egress through the proxy pool.
+
+        Returns (proxy_url, proxy_id); ("", "") means the pool is not in play and the
+        caller goes direct. Bound exits win; a disabled or unhealthy bound exit borrows
+        a stable alternate (same account -> same borrowed exit for the duration of the
+        outage) and never falls back to direct.
+        """
+        if not proxy_pool.is_enabled():
+            return "", ""
+        account = account_service.get_account(self.access_token) if self.access_token else {}
+        route_key = account_route_key(account)
+        proxy_id = str((account or {}).get("proxy_id") or "").strip()
+        if proxy_id:
+            entry, _route = proxy_pool.route_bound(proxy_id, route_key)
+        else:
+            entry, _route = proxy_pool.route_unbound(route_key) if self.access_token else proxy_pool.route_anonymous()
+        if entry is None:
+            raise RuntimeError("proxy pool is enabled but has no available egress")
+        return entry["url"], entry["id"]
+
     def __init__(self, access_token: str = "") -> None:
         """初始化后端客户端。
 
@@ -213,11 +236,12 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
-        self.session = requests.Session(**proxy_settings.build_session_kwargs(
-            account=self.account,
-            impersonate=self.fp["impersonate"],
-            verify=True,
-        ))
+        self.egress_proxy_url, self.egress_proxy_id = self._egress_profile()
+        session_kwargs = {"impersonate": self.fp["impersonate"], "verify": True, "trust_env": False}
+        if self.egress_proxy_url:
+            session_kwargs["proxy"] = self.egress_proxy_url
+        self.session = requests.Session(**session_kwargs)
+        proxy_pool.track_session(self.session, SimpleNamespace(proxy_id=self.egress_proxy_id))
         self.session.headers.update({
             "User-Agent": self.user_agent,
             "Origin": self.base_url,
@@ -360,7 +384,8 @@ class OpenAIBackendAPI:
             headers["Authorization"] = f"Bearer {self.access_token}"
         try:
             result = browser_request(method, self.base_url + path, headers,
-                                     json.dumps(json_body, ensure_ascii=False) if json_body is not None else "")
+                                     json.dumps(json_body, ensure_ascii=False) if json_body is not None else "",
+                                     proxy=self.egress_proxy_url)
         except SentinelSolverError:
             logger.warning({"event": "browser_request_unavailable", "path": route})
             return None
@@ -500,7 +525,8 @@ class OpenAIBackendAPI:
         turnstile_token = ""
         turnstile_info = data.get("turnstile") or {}
         if turnstile_info.get("required"):
-            turnstile_token = solve_turnstile(turnstile_info.get("dx", ""), source_p, data)
+            solve_args = (turnstile_info.get("dx", ""), source_p, data)
+            turnstile_token = solve_turnstile(*solve_args, **({"proxy": self.egress_proxy_url} if self.egress_proxy_url else {}))
 
         return ChatRequirements(
             token=data.get("token", ""),
@@ -2806,7 +2832,8 @@ class OpenAIBackendAPI:
         turnstile_info = prepare_data.get("turnstile") or {}
         if turnstile_info.get("required"):
             # 传入完整 prepare 响应，让求解器调用页面自带的 Turnstile 模块。
-            turnstile_token = solve_turnstile(turnstile_info.get("dx", ""), p_token, prepare_data)
+            solve_args = (turnstile_info.get("dx", ""), p_token, prepare_data)
+            turnstile_token = solve_turnstile(*solve_args, **({"proxy": self.egress_proxy_url} if self.egress_proxy_url else {}))
 
         finalize_path = base + "/finalize"
         response = self._json_request("POST", finalize_path, {

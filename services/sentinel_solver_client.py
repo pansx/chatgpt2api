@@ -73,7 +73,7 @@ def solver_user_agent() -> str:
         return value
 
 
-def solve_turnstile(dx: str, p: str, requirements: dict | None = None) -> str:
+def solve_turnstile(dx: str, p: str, requirements: dict | None = None, proxy: str = "") -> str:
     """Solve the Turnstile challenge.
 
     `dx` comes from the prepare response and `p` is the requirements token we sent.
@@ -94,6 +94,8 @@ def solve_turnstile(dx: str, p: str, requirements: dict | None = None) -> str:
     body: dict[str, object] = {"dx": dx, "p": p}
     if requirements:
         body["requirements"] = requirements
+    if proxy:
+        body["proxy"] = proxy
     try:
         response = requests.post(
             f"{base_url}/v1/turnstile",
@@ -121,7 +123,7 @@ def solve_turnstile(dx: str, p: str, requirements: dict | None = None) -> str:
     return token
 
 
-def browser_request(method: str, url: str, headers: dict[str, str] | None = None, body: str = "") -> dict:
+def browser_request(method: str, url: str, headers: dict[str, str] | None = None, body: str = "", proxy: str = "") -> dict:
     """Run a JSON request through the solver's real Chromium page."""
     base_url = config.sentinel_solver_url
     if not base_url:
@@ -129,7 +131,7 @@ def browser_request(method: str, url: str, headers: dict[str, str] | None = None
     try:
         response = requests.post(
             f"{base_url}/v1/request", headers=_solver_headers(),
-            json={"method": method, "url": url, "headers": headers or {}, "body": body},
+            json={"method": method, "url": url, "headers": headers or {}, "body": body, **({"proxy": proxy} if proxy else {})},
             timeout=SOLVER_SOLVE_TIMEOUT_SECONDS,
         )
     except Exception as exc:  # noqa: BLE001
