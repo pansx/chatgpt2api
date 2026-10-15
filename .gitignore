@@ -20,6 +20,8 @@ docker-compose-local.yml
 # Environment variables
 .env
 .env.local
+.codex/compose*
+.codex/clash.yaml
 
 # Database files
 *.db
