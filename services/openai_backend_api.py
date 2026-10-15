@@ -9,7 +9,6 @@ import time
 
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -23,7 +22,7 @@ from PIL import Image
 from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
-from services.sentinel_solver_client import solve_turnstile, solver_user_agent
+from services.sentinel_solver_client import SentinelSolverError, browser_request, solve_turnstile, solver_user_agent
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
@@ -31,6 +30,20 @@ from utils.pow import build_legacy_requirements_token, build_proof_token, parse_
 
 class InvalidAccessTokenError(RuntimeError):
     pass
+
+
+class CloudflareChallengeError(RuntimeError):
+    """请求被 Cloudflare 挑战拦截，不能据此判断账号无效。"""
+
+
+class _BrowserResponse:
+    def __init__(self, status: int, headers: dict, text: str) -> None:
+        self.status_code = status
+        self.headers = requests.Headers(headers)
+        self.text = text
+
+    def json(self) -> Any:
+        return json.loads(self.text)
 
 
 class ImageTaskError(RuntimeError):
@@ -299,6 +312,8 @@ class OpenAIBackendAPI:
         return 0, None
 
     def _raise_on_error(self, response: Any, path: str) -> None:
+        if self._is_cloudflare_challenge(response):
+            raise CloudflareChallengeError(f"{path} failed: HTTP 403 Cloudflare challenge")
         if response.status_code == 401:
             raise InvalidAccessTokenError(f"token invalidated ({path})")
         raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
@@ -326,40 +341,68 @@ class OpenAIBackendAPI:
             response = request()
         return response
 
+    def _browser_json(self, method: str, path: str, json_body: dict | None = None) -> _BrowserResponse | None:
+        """纯 JSON 请求优先使用真实浏览器；求解服务不可用时回退到 curl。"""
+        if not config.sentinel_solver_url:
+            return None
+        route = path.split("?", 1)[0]
+        headers = {
+            "Content-Type": "application/json",
+            "OAI-Device-Id": self.device_id,
+            "OAI-Session-Id": self.session_id,
+            "OAI-Language": "zh-CN",
+            "OAI-Client-Version": self.client_version,
+            "OAI-Client-Build-Number": str(self.client_build_number),
+            "X-OpenAI-Target-Path": route,
+            "X-OpenAI-Target-Route": route,
+        }
+        if self.access_token:
+            headers["Authorization"] = f"Bearer {self.access_token}"
+        try:
+            result = browser_request(method, self.base_url + path, headers,
+                                     json.dumps(json_body, ensure_ascii=False) if json_body is not None else "")
+        except SentinelSolverError:
+            logger.warning({"event": "browser_request_unavailable", "path": route})
+            return None
+        if not result.get("status"):
+            return None
+        return _BrowserResponse(result["status"], result["headers"], result["text"])
+
+    def _json_request(self, method: str, path: str, json_body: dict | None = None,
+                      timeout: int = 20) -> Any:
+        def request():
+            response = self._browser_json(method, path, json_body)
+            if response is not None:
+                return response
+            headers = self._headers(path.split("?", 1)[0], {"Content-Type": "application/json"})
+            if method == "GET":
+                return self.session.get(self.base_url + path, headers=headers, timeout=timeout)
+            return self.session.post(self.base_url + path, headers=headers, json=json_body, timeout=timeout)
+
+        return self._retry_cloudflare_challenge(request)
+
     def _get_me(self) -> Dict[str, Any]:
         path = "/backend-api/me"
-        response = self._retry_cloudflare_challenge(
-            lambda: self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
-        )
+        response = self._json_request("GET", path)
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()
 
     def _get_conversation_init(self) -> Dict[str, Any]:
         path = "/backend-api/conversation/init"
-        response = self._retry_cloudflare_challenge(
-            lambda: self.session.post(
-                self.base_url + path,
-                headers=self._headers(path, {"Content-Type": "application/json"}),
-                json={
-                    "gizmo_id": None,
-                    "requested_default_model": None,
-                    "conversation_id": None,
-                    "timezone_offset_min": -480,
-                },
-                timeout=20,
-            )
-        )
+        response = self._json_request("POST", path, {
+            "gizmo_id": None,
+            "requested_default_model": None,
+            "conversation_id": None,
+            "timezone_offset_min": -480,
+        })
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()
 
     def _get_default_account(self) -> Dict[str, Any]:
         path = "/backend-api/accounts/check/v4-2023-04-27"
-        response = self._retry_cloudflare_challenge(
-            lambda: self.session.get(self.base_url + path + "?timezone_offset_min=-480",
-                                     headers=self._headers(path), timeout=20)
-        )
+        response = self._json_request("GET", path + "?timezone_offset_min=-480")
         if response.status_code != 200:
             self._raise_on_error(response, path)
         payload = response.json()
@@ -379,20 +422,10 @@ class OpenAIBackendAPI:
         """获取当前 token 的账号信息。"""
         if not self.access_token:
             raise RuntimeError("access_token is required")
-        executor = ThreadPoolExecutor(max_workers=3)
-        try:
-            me_future = executor.submit(self._get_me)
-            init_future = executor.submit(self._get_conversation_init)
-            account_future = executor.submit(self._get_default_account)
-            me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
-        except (KeyboardInterrupt, SystemExit):
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        except BaseException:
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        else:
-            executor.shutdown(wait=True, cancel_futures=True)
+        # 同一账号的刷新请求串行发送，避免同时占用浏览器会话。
+        me_payload = self._get_me()
+        init_payload = self._get_conversation_init()
+        default_account = self._get_default_account()
 
         plan_type = str(default_account.get("plan_type") or "free")
 
@@ -2746,12 +2779,7 @@ class OpenAIBackendAPI:
         )
 
         prepare_path = base + "/prepare"
-        response = self.session.post(
-            self.base_url + prepare_path,
-            headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
-            json={"p": p_token},
-            timeout=30,
-        )
+        response = self._json_request("POST", prepare_path, {"p": p_token}, timeout=30)
         ensure_ok(response, "chat_requirements_prepare")
         prepare_data = response.json()
 
@@ -2776,16 +2804,11 @@ class OpenAIBackendAPI:
             turnstile_token = solve_turnstile(turnstile_info.get("dx", ""), p_token, prepare_data)
 
         finalize_path = base + "/finalize"
-        response = self.session.post(
-            self.base_url + finalize_path,
-            headers=self._headers(finalize_path, {"Content-Type": "application/json"}),
-            json={
-                "prepare_token": prepare_data.get("prepare_token", ""),
-                "proofofwork": proof_token,
-                "turnstile": turnstile_token,
-            },
-            timeout=30,
-        )
+        response = self._json_request("POST", finalize_path, {
+            "prepare_token": prepare_data.get("prepare_token", ""),
+            "proofofwork": proof_token,
+            "turnstile": turnstile_token,
+        }, timeout=30)
         ensure_ok(response, "chat_requirements_finalize")
         data = response.json()
         self._drop_restricted_cookies()

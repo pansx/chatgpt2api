@@ -17,6 +17,7 @@ Turnstile。主服务本身不打包浏览器，只通过 HTTP 调用这里。
 | --- | --- | --- |
 | GET | `/health` | 页面状态及页面使用的 UA（主服务据此生成 requirements/proof token） |
 | POST | `/v1/turnstile` | `{"dx", "p", "requirements"}` → `{"token"}`；`requirements` 是 prepare 的完整响应，给了它就调用页面自带的 turnstile 模块求解；只给 `dx`/`p` 时退回内置 VM |
+| POST | `/v1/request` | 在已通过 Cloudflare 的 Chromium 页面中发送受限的 ChatGPT JSON 请求；仅允许 `/backend-api` 和 `/backend-anon` 的账号刷新及 sentinel prepare/finalize 路径 |
 | POST | `/v1/so` | `{"collector_dx", "snapshot_dx", "p"}` → `{"token"}`；目前对话接口还不强制要求 |
 
 `solve` 优先走页面自带的 turnstile 模块（`import` chatgpt.com 自己的 chunk 后调用
@@ -26,10 +27,15 @@ Turnstile。主服务本身不打包浏览器，只通过 HTTP 调用这里。
 
 设置了 `SENTINEL_SOLVER_KEY` 时，请求需要带 `Authorization: Bearer <key>` 头。
 
-### 只看挑战参数
+### 信任边界与代理
 
-求解服务只接收 `dx`、`p` 和 prepare 响应等挑战参数。账号 access token、Cookie、用户 prompt 都不会离开主
-服务进程。建议仅在内网提供服务，并配置访问密钥。
+`/v1/request` 会接收账号 Authorization 和 JSON 请求体，并返回账号信息或 sentinel 数据。
+服务端过滤 Cookie、User-Agent、Sec-*、Origin 等浏览器自管头，保留 Authorization；限制目标路径并禁止重定向。
+请把 solver 当作可信服务，仅在内网提供访问，并配置访问密钥。对话 prompt 和 SSE 仍由主服务发送。
+
+账号刷新和 sentinel prepare/finalize 优先走浏览器；未配置、不可达或旧 solver 不支持此端点时回退到 curl。
+真实 HTTP 401/JSON 403 直接交给原错误处理；仅 Cloudflare challenge 403 会重试。三个账号刷新接口串行调用。
+solver 与主服务必须使用同一出口；本 PR 不包含出口代理池、proxy_id 自动绑定或按账号切换浏览器出口。
 
 ## 部署
 

@@ -6,8 +6,8 @@ is rejected, and an incomplete handshake does not surface as 403: the
 conversation endpoint answers a disguised `404 {"detail": "Model not found"}`.
 The solver keeps a headless Chromium on that page and computes the token for us.
 
-The solver only ever receives challenge parameters (`dx` and the requirements
-`p`); account tokens, cookies and user prompts stay in this process.
+The JSON browser route forwards account Authorization to the trusted solver.
+Conversation prompts and streaming responses continue to use the main service.
 """
 
 from __future__ import annotations
@@ -119,3 +119,29 @@ def solve_turnstile(dx: str, p: str, requirements: dict | None = None) -> str:
     if not token:
         raise SentinelSolverError("sentinel solver returned an empty turnstile token")
     return token
+
+
+def browser_request(method: str, url: str, headers: dict[str, str] | None = None, body: str = "") -> dict:
+    """Run a JSON request through the solver's real Chromium page."""
+    base_url = config.sentinel_solver_url
+    if not base_url:
+        raise SentinelSolverError("sentinel solver is not configured")
+    try:
+        response = requests.post(
+            f"{base_url}/v1/request", headers=_solver_headers(),
+            json={"method": method, "url": url, "headers": headers or {}, "body": body},
+            timeout=SOLVER_SOLVE_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise SentinelSolverError(f"sentinel browser request failed: {exc}") from exc
+    if response.status_code != 200:
+        raise SentinelSolverError(f"sentinel browser request returned HTTP {response.status_code}")
+    try:
+        data = response.json()
+        if (not isinstance(data, dict) or type(data.get("status")) is not int
+                or not 0 <= data["status"] <= 599 or not isinstance(data.get("headers"), dict)
+                or not isinstance(data.get("text"), str)):
+            raise ValueError("invalid browser response")
+        return data
+    except (TypeError, ValueError) as exc:
+        raise SentinelSolverError("invalid sentinel browser response") from exc
