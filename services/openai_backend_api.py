@@ -2763,6 +2763,11 @@ class OpenAIBackendAPI:
             headers=self._bootstrap_headers(),
             timeout=30,
         )
+        if self._is_cloudflare_challenge(response):
+            # 首页只提供 PoW 元数据，挑战页不能阻止后续浏览器握手。
+            self.pow_script_sources = [DEFAULT_POW_SCRIPT]
+            self.pow_data_build = ""
+            return
         ensure_ok(response, "bootstrap")
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
         if not self.pow_script_sources:
