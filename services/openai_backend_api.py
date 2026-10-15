@@ -70,6 +70,20 @@ DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 DEFAULT_IMPERSONATE = "chrome146"
 LEGACY_IMPERSONATES = {"chrome110", "edge101"}
+# 请求头中的浏览器版本与 TLS 配置保持一致，避免混用 Edge 身份。
+_FINGERPRINT_BROWSER_VERSION = DEFAULT_IMPERSONATE.removeprefix("chrome") or "146"
+FINGERPRINT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    f"(KHTML, like Gecko) Chrome/{_FINGERPRINT_BROWSER_VERSION}.0.0.0 Safari/537.36"
+)
+FINGERPRINT_SEC_CH_UA = (
+    f'"Chromium";v="{_FINGERPRINT_BROWSER_VERSION}", '
+    f'"Google Chrome";v="{_FINGERPRINT_BROWSER_VERSION}", "Not/A)Brand";v="99"'
+)
+FINGERPRINT_FULL_VERSION = f'"{_FINGERPRINT_BROWSER_VERSION}.0.0.0"'
+FINGERPRINT_FULL_VERSION_LIST = (
+    f'"Chromium";v="{_FINGERPRINT_BROWSER_VERSION}.0.0.0", "Not/A)Brand";v="99.0.0.0"'
+)
 CLIENT_CREATED_ROOT = "client-created-root"
 IMAGE_CREATION_MENTION = "@创建图像"
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
@@ -202,8 +216,8 @@ class OpenAIBackendAPI:
             "Sec-Ch-Ua": self.fp["sec-ch-ua"],
             "Sec-Ch-Ua-Arch": '"x86"',
             "Sec-Ch-Ua-Bitness": '"64"',
-            "Sec-Ch-Ua-Full-Version": '"143.0.3650.96"',
-            "Sec-Ch-Ua-Full-Version-List": '"Microsoft Edge";v="143.0.3650.96", "Chromium";v="143.0.7499.147", "Not A(Brand";v="24.0.0.0"',
+            "Sec-Ch-Ua-Full-Version": FINGERPRINT_FULL_VERSION,
+            "Sec-Ch-Ua-Full-Version-List": FINGERPRINT_FULL_VERSION_LIST,
             "Sec-Ch-Ua-Mobile": self.fp["sec-ch-ua-mobile"],
             "Sec-Ch-Ua-Model": '""',
             "Sec-Ch-Ua-Platform": self.fp["sec-ch-ua-platform"],
@@ -257,17 +271,13 @@ class OpenAIBackendAPI:
             value = str(account.get(key) or "").strip()
             if value:
                 fp[key] = value
-        fp.setdefault(
-            "user-agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
-        )
+        fp.setdefault("user-agent", FINGERPRINT_UA)
         if fp.get("impersonate") in LEGACY_IMPERSONATES:
             fp.pop("impersonate")
         fp.setdefault("impersonate", DEFAULT_IMPERSONATE)
         fp.setdefault("oai-device-id", new_uuid())
         fp.setdefault("oai-session-id", new_uuid())
-        fp.setdefault("sec-ch-ua", '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"')
+        fp.setdefault("sec-ch-ua", FINGERPRINT_SEC_CH_UA)
         fp.setdefault("sec-ch-ua-mobile", "?0")
         fp.setdefault("sec-ch-ua-platform", '"Windows"')
         return fp
