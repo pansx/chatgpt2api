@@ -8,7 +8,7 @@
 安装完成后按 Helm 提示读取密钥并用 port-forward 访问 http://localhost:8000。
 需要自定义 API 密钥时加 --set-string authKey=你的密钥。
 
-默认使用 pansx 的 sentinel-2026-10 镜像，单副本 API + 单副本 solver。
+默认使用 pansx 的 sentinel-2026-10-cf-retry 镜像，单副本 API + 单副本 solver。
 账号和 SQLite 数据保存在 10Gi PVC，Chromium 下载缓存保存在 2Gi PVC。
 首次启动需要 root 权限安装系统依赖及联网下载 Chromium；启动探针最多等待 30 分钟。
 主服务配置保存在数据卷内，升级和重启后保留。卸载会删除 PVC，请先备份账号数据。
