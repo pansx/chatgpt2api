@@ -24,7 +24,13 @@ from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
 from services.proxy_pool_service import account_route_key, proxy_pool
-from services.sentinel_solver_client import SentinelSolverError, browser_request, solve_turnstile, solver_user_agent
+from services.sentinel_solver_client import (
+    SentinelSolverError,
+    browser_request,
+    solve_turnstile,
+    solver_cookies,
+    solver_user_agent,
+)
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.identity import IDENTITY_TIMEZONE, identity_timezone_offset_min
 from utils.log import logger
@@ -102,6 +108,13 @@ FINGERPRINT_FULL_VERSION_LIST = (
 )
 CLIENT_CREATED_ROOT = "client-created-root"
 IMAGE_CREATION_MENTION = "@创建图像"
+# Cookies Cloudflare installs. A challenge response sets them, and carrying them into a
+# retry mostly earns another challenge, so they are cleared before backing off. Cookies
+# the solver browser handed us match this prefix too and are exempt: see
+# `_drop_cloudflare_cookies`.
+CLOUDFLARE_COOKIE_PREFIXES = ("__cf", "_cf", "cf_")
+# How many times a challenged upstream call is attempted, on both routes.
+CLOUDFLARE_RETRY_ATTEMPTS = 3
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 CODEX_RESPONSES_MODEL = "gpt-5.5"
 SEARCH_MODEL = "gpt-5-5"
@@ -271,6 +284,10 @@ class OpenAIBackendAPI:
         })
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+        # Cookies the solver browser gave this exit, kept out of the challenge purge.
+        self._solver_cookie_names: set[str] = set()
+        self._solver_cookies_synced = False
+        self._install_cloudflare_retry()
 
     def close(self) -> None:
         if getattr(self, "_closed", False):
@@ -336,6 +353,87 @@ class OpenAIBackendAPI:
                 return int(item.get("remaining") or 0), str(item.get("reset_after") or "") or None
         return 0, None
 
+    def _install_cloudflare_retry(self) -> None:
+        """Move the Cloudflare-challenge retry down to the transport layer.
+
+        chatgpt.com answers several endpoints with an intermittent managed challenge
+        (403 + `cf-mitigated: challenge` + HTML); the same call typically clears on a
+        retry. Only `_json_request` used to retry, which left every other path bare -
+        the image upload, the conversation download and the model list all failed
+        outright when they happened to land on a challenge. Wrapping the session's
+        verbs covers every call site, including the ones added later.
+        """
+        session = getattr(self, "session", None)
+        if session is None or getattr(self, "_cloudflare_retry_installed", False):
+            return
+        for verb in ("get", "post", "put", "patch", "delete"):
+            original = getattr(session, verb, None)
+            if original is None:
+                continue
+            setattr(session, verb, self._make_retrying_verb(original))
+        self._cloudflare_retry_installed = True
+
+    def _make_retrying_verb(self, original: Callable[..., Any]) -> Callable[..., Any]:
+        """Wrap one session verb so this session picks up its cookies and retries challenges.
+
+        Every upstream call goes through one of these, which makes this the one place
+        where a session can adopt its own exit's cookies *before* the call that needs
+        them goes out - including the image upload and the model list, which run before
+        the handshake. A call site added later is covered by construction.
+        """
+        retry = self._retry_cloudflare_challenge
+
+        def retrying_verb(*args: Any, **kwargs: Any) -> Any:
+            self._apply_solver_cookies_once()
+            return retry(lambda: original(*args, **kwargs))
+
+        return retrying_verb
+
+    def _apply_solver_cookies_once(self) -> None:
+        """Sync the exit's cookies the first time this session calls upstream.
+
+        Once per session: a cold session has nothing to adopt, a warm one keeps what it
+        has, and `_apply_solver_cookies` re-reads the same cached `/health` anyway.
+
+        This runs on the request path, so a solver hiccup is logged and dropped: the
+        cookies are an improvement, never a precondition.
+        """
+        if self._solver_cookies_synced:
+            return
+        self._solver_cookies_synced = True
+        try:
+            self._apply_solver_cookies()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning({"event": "sentinel_solver_cookies_failed", "error": str(exc)})
+
+    def _apply_solver_cookies(self) -> None:
+        """Adopt the cleared solver page's chatgpt.com cookies on this session.
+
+        Cloudflare scores some paths per client: the same curl_cffi fingerprint is
+        challenged persistently without the browser's cookies and is let through with
+        them (measured on the pool's US exits: 403 challenge for every attempt bare,
+        200 on the first try with them). Cookies are bound to the egress that earned
+        them, so this asks for the lane matching this session's own exit and is a no-op
+        when that lane has not been warmed yet. A pool exit must never borrow another
+        exit's cookies, and the solver's own default egress is not ours: going direct
+        therefore picks up nothing rather than the wrong set.
+        """
+        cookies = solver_cookies(self.egress_proxy_url)
+        if not cookies:
+            return
+        applied = []
+        for name, value in cookies.items():
+            try:
+                self.session.cookies.set(name, value, domain=".chatgpt.com")
+                applied.append(name)
+            except Exception:  # noqa: BLE001
+                continue
+        if applied:
+            # Remember them so a challenge retry does not clear the very cookies that
+            # get us past Cloudflare's per-path check (see _drop_cloudflare_cookies).
+            self._solver_cookie_names |= set(applied)
+            logger.debug({"event": "sentinel_solver_cookies_applied", "cookies": sorted(applied)})
+
     def _raise_on_error(self, response: Any, path: str) -> None:
         if self._is_cloudflare_challenge(response):
             raise CloudflareChallengeError(f"{path} failed: HTTP 403 Cloudflare challenge")
@@ -356,18 +454,60 @@ class OpenAIBackendAPI:
             or "text/html" in content_type
         )
 
-    def _retry_cloudflare_challenge(self, request: Callable[[], requests.Response]) -> requests.Response:
-        """账号刷新遇到临时挑战时最多尝试三次，避免健康账号被误判为无额度。"""
+    def _retry_cloudflare_challenge(self, request: Callable[[], requests.Response],
+                                    attempts: int = CLOUDFLARE_RETRY_ATTEMPTS) -> requests.Response:
+        """账号刷新遇到临时挑战时最多尝试三次，避免健康账号被误判为无额度。
+
+        Installed on the session's verbs in `_install_cloudflare_retry`, so every
+        upstream call retries rather than only the ones `_json_request` used to wrap.
+        """
         response = request()
-        for attempt in range(1, 3):
+        for attempt in range(1, attempts):
             if not self._is_cloudflare_challenge(response):
                 return response
-            time.sleep(1.5 * attempt)
+            self._back_off(attempt)
             response = request()
         return response
 
+    def _back_off(self, attempt: int) -> None:
+        """Drop the challenge's own cookies and wait before the next attempt.
+
+        The challenge response installs cookies that mark this session as suspicious:
+        retrying on top of them mostly returns another challenge. Clearing them lets
+        upstream re-evaluate this client as a fresh visitor instead of an
+        already-flagged one. The solver's cookies are exempt (see
+        `_drop_cloudflare_cookies`).
+        """
+        self._drop_cloudflare_cookies()
+        time.sleep(1.5 * attempt)
+
+    def _drop_cloudflare_cookies(self) -> None:
+        """Drop the Cloudflare cookies a challenge response left on this session.
+
+        Cookies the solver browser handed us match the same prefix and are kept: they
+        are the ones that pass the per-path check, so clearing them on retry would
+        throw away the fix.
+        """
+        keep = self._solver_cookie_names or set()
+        try:
+            jar = self.session.cookies.jar
+            for cookie in list(jar):
+                name = str(getattr(cookie, "name", ""))
+                if name in keep or not name.startswith(CLOUDFLARE_COOKIE_PREFIXES):
+                    continue
+                jar.clear(cookie.domain, cookie.path, cookie.name)
+        except Exception as exc:  # noqa: BLE001
+            # Cookie cleanup must never break a request.
+            logger.warning({"event": "cloudflare_cookie_clear_failed", "error": str(exc)})
+
     def _browser_json(self, method: str, path: str, json_body: dict | None = None) -> _BrowserResponse | None:
-        """纯 JSON 请求优先使用真实浏览器；求解服务不可用时回退到 curl。"""
+        """纯 JSON 请求优先使用真实浏览器；求解服务不可用时回退到 curl。
+
+        The browser leg is not a session call, so the challenge retry the session verbs
+        carry does not reach it: a challenged page would fail these preflight endpoints
+        outright, and they are the preferred route whenever a solver is configured. It
+        retries here, on the same schedule the session uses.
+        """
         if not config.sentinel_solver_url:
             return None
         route = path.split("?", 1)[0]
@@ -383,29 +523,43 @@ class OpenAIBackendAPI:
         }
         if self.access_token:
             headers["Authorization"] = f"Bearer {self.access_token}"
-        try:
-            result = browser_request(method, self.base_url + path, headers,
-                                     json.dumps(json_body, ensure_ascii=False) if json_body is not None else "",
-                                     proxy=self.egress_proxy_url)
-        except SentinelSolverError:
-            logger.warning({"event": "browser_request_unavailable", "path": route})
-            return None
-        if not result.get("status"):
-            return None
-        return _BrowserResponse(result["status"], result["headers"], result["text"])
+
+        def request() -> _BrowserResponse | None:
+            try:
+                result = browser_request(method, self.base_url + path, headers,
+                                         json.dumps(json_body, ensure_ascii=False) if json_body is not None else "",
+                                         proxy=self.egress_proxy_url)
+            except SentinelSolverError:
+                logger.warning({"event": "browser_request_unavailable", "path": route})
+                return None
+            if not result.get("status"):
+                return None
+            return _BrowserResponse(result["status"], result["headers"], result["text"])
+
+        response = request()
+        for attempt in range(1, CLOUDFLARE_RETRY_ATTEMPTS):
+            # A solver that went away mid-retry is a transport problem, not a challenge:
+            # hand it to the curl fallback rather than spending the remaining attempts.
+            if response is None or not self._is_cloudflare_challenge(response):
+                break
+            self._back_off(attempt)
+            response = request()
+        return response
 
     def _json_request(self, method: str, path: str, json_body: dict | None = None,
                       timeout: int = 20) -> Any:
-        def request():
-            response = self._browser_json(method, path, json_body)
-            if response is not None:
-                return response
-            headers = self._headers(path.split("?", 1)[0], {"Content-Type": "application/json"})
-            if method == "GET":
-                return self.session.get(self.base_url + path, headers=headers, timeout=timeout)
-            return self.session.post(self.base_url + path, headers=headers, json=json_body, timeout=timeout)
+        """纯 JSON 请求：先走已通关浏览器，回退 curl。
 
-        return self._retry_cloudflare_challenge(request)
+        Each leg retries its own challenge - the browser leg here, curl on the session
+        verbs (see `_install_cloudflare_retry`) - so neither path is wrapped twice.
+        """
+        response = self._browser_json(method, path, json_body)
+        if response is not None:
+            return response
+        headers = self._headers(path.split("?", 1)[0], {"Content-Type": "application/json"})
+        if method == "GET":
+            return self.session.get(self.base_url + path, headers=headers, timeout=timeout)
+        return self.session.post(self.base_url + path, headers=headers, json=json_body, timeout=timeout)
 
     def _get_me(self) -> Dict[str, Any]:
         path = "/backend-api/me"
@@ -2805,6 +2959,9 @@ class OpenAIBackendAPI:
         base = "/backend-api/sentinel/chat-requirements" if self.access_token else (
             "/backend-anon/sentinel/chat-requirements"
         )
+        # Cloudflare 对这条路径按客户端打分：裸请求会被持续性挑战（重试无效），带上
+        # 本出口浏览器已通关的 cookie 才放行。cookie 由 session 动词在本次会话的首个
+        # 上游调用前同步进来（见 _make_retrying_verb）。
         sentinel_user_agent = self._sentinel_user_agent()
         p_token = build_legacy_requirements_token(
             sentinel_user_agent, self.pow_script_sources, self.pow_data_build

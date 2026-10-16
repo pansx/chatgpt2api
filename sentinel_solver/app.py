@@ -225,6 +225,7 @@ class _Lane:
         self._lock = asyncio.Lock()
         self._request_lock = asyncio.Lock()
         self._turnstile_asset = ""
+        self.cookies: dict[str, str] = {}
         self.last_error = ""
         self.last_used = time.monotonic()
 
@@ -240,6 +241,8 @@ class _Lane:
                 pass
         self._context = None
         self._page = None
+        # A closed context takes its cookies with it, so stop reporting them.
+        self.cookies = {}
 
     async def page(self) -> Page:
         async with self._lock:
@@ -288,8 +291,34 @@ class _Lane:
         self._page = page
         self._opened_at = time.monotonic()
         self.last_error = ""
+        await self._capture_cookies()
         label = f" (proxy={self.proxy_spec['server']})" if self.proxy_spec else ""
         print(f"[sentinel-solver] chatgpt.com page ready{label}: {await page.title()!r}", flush=True)
+
+    async def _capture_cookies(self) -> None:
+        """Record the chatgpt.com cookies this cleared page holds (see `exit_status`).
+
+        Cloudflare scores some endpoints per client rather than per request: the
+        same curl_cffi fingerprint gets a persistent 403 challenge on
+        `/backend-api/sentinel/chat-requirements/prepare` without these cookies and
+        is let through with them. Retrying does not substitute for them. The main
+        service syncs them onto its own session for this lane's egress only.
+        """
+        self.cookies = {}
+        if self._context is None:
+            return
+        try:
+            jar = await self._context.cookies("https://chatgpt.com")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[sentinel-solver] cookie capture failed: {exc}", flush=True)
+            return
+        self.cookies = {
+            str(item.get("name")): str(item.get("value"))
+            for item in jar
+            if item.get("name") and item.get("value")
+        }
+        if self.cookies:
+            print(f"[sentinel-solver] captured cookies: {', '.join(sorted(self.cookies))}", flush=True)
 
     @staticmethod
     async def _is_ready(page: Page | None) -> bool:
@@ -436,6 +465,10 @@ class _Lane:
             "page_age_seconds": int(time.monotonic() - self._opened_at) if self._opened_at else None,
             "last_used_seconds_ago": int(time.monotonic() - self.last_used),
             "last_error": self.last_error or None,
+            # Cookies the cleared page holds (mainly Cloudflare's __cf_bm / _cfuvid and
+            # oai-did). They are bound to the IP that earned them, so they are reported
+            # per lane and callers must take their own exit's set: see `exit_status`.
+            "cookies": dict(self.cookies),
         }
 
 
@@ -486,7 +519,7 @@ class SolverPage:
 
     async def _lane(self, proxy: str) -> _Lane:
         spec = _lane_proxy_spec(proxy)
-        key = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest() if spec else ""
+        key = self._lane_key(spec)
         now = time.monotonic()
         to_close: list[_Lane] = []
         async with self._lanes_lock:
@@ -510,6 +543,38 @@ class SolverPage:
         for stale in to_close:
             await stale.close()
         return lane
+
+    @staticmethod
+    def _lane_key(spec: dict[str, str]) -> str:
+        """Stable lane key for a Playwright proxy spec, "" for the default egress.
+
+        Credentials are part of the key: residential pools commonly share one
+        host:port and distinguish exits by username, so dropping them would make one
+        exit's cookies look like another's.
+        """
+        if not spec:
+            return ""
+        return hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
+
+    async def exit_status(self, proxy: str) -> dict[str, object]:
+        """Cookies the warmed lane for `proxy` holds, plus whether that lane is open.
+
+        The caller must pass its own egress. Cloudflare binds these cookies to the IP
+        that earned them, so another exit's set does nothing for this request, and the
+        default lane here is the solver's own egress rather than the caller's. An empty
+        `cookies` just means that exit has not been used yet: the caller has nothing to
+        attach, which is not an error.
+
+        Read-only by design, so a health probe never warms, evicts or reopens a lane.
+        """
+        key = self._lane_key(_lane_proxy_spec(proxy))
+        if not key:
+            return {"lane": None, "warmed": False, "cookies": {}}
+        async with self._lanes_lock:
+            lane = self._lanes.get(key)
+            if lane is None:
+                return {"lane": key, "warmed": False, "cookies": {}}
+            return {"lane": key, "warmed": bool(lane.status()["ready"]), "cookies": dict(lane.cookies)}
 
     async def solve_turnstile(
         self, requirements: dict[str, Any] | None, dx: str, p: str, proxy: str = ""
@@ -587,8 +652,18 @@ def require_key(authorization: str | None) -> None:
 
 
 @app.get("/health")
-async def health() -> dict[str, object]:
-    return solver.status()
+async def health(proxy: str = "") -> dict[str, object]:
+    """Solver status, plus the asked-for exit's cookies when `proxy` names one.
+
+    `?proxy=<pool exit>` is how the main service picks up the cookies its own egress
+    earned (see `SolverPage.exit_status`). The plain `/health` reports every lane's
+    cookies for inspection but never merges them into one set, because a merged set
+    would silently attach another exit's cookies to this request.
+    """
+    status = solver.status()
+    if proxy.strip():
+        status["exit"] = await solver.exit_status(proxy)
+    return status
 
 
 @app.post("/v1/turnstile")

@@ -15,10 +15,17 @@ Turnstile。主服务本身不打包浏览器，只通过 HTTP 调用这里。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/health` | 页面状态及页面使用的 UA（主服务据此生成 requirements/proof token） |
+| GET | `/health` | 页面状态、页面使用的 UA（主服务据此生成 requirements/proof token），以及每个 lane 抓到的 cookie |
+| GET | `/health?proxy=<出口>` | 同上，额外返回 `exit`：该出口那条 lane 的 cookie 与是否已开页 |
 | POST | `/v1/turnstile` | `{"dx", "p", "requirements"}` → `{"token"}`；`requirements` 是 prepare 的完整响应，给了它就调用页面自带的 turnstile 模块求解；只给 `dx`/`p` 时退回内置 VM |
 | POST | `/v1/request` | 在已通过 Cloudflare 的 Chromium 页面中发送受限的 ChatGPT JSON 请求；仅允许 `/backend-api` 和 `/backend-anon` 的账号刷新及 sentinel prepare/finalize 路径 |
 | POST | `/v1/so` | `{"collector_dx", "snapshot_dx", "p"}` → `{"token"}`；目前对话接口还不强制要求 |
+
+`/health?proxy=` 是按出口取 cookie 的唯一入口：Cloudflare 对部分路径（`sentinel/chat-requirements`）
+按客户端打分，同一个 curl_cffi 指纹不带这些 cookie 会被**持续性** 403 挑战（重试无效），带上同出口那条
+lane 的 cookie 立刻 200。cookie 绑定签发它的出口 IP，所以接口按 lane 返回、由调用方指定自己的出口；
+`/health` 不会把多条 lane 合并成一份全局 cookie（合并会让别的出口的 cookie 被静默用上）。
+`?proxy=` 只读，不会顺带开页或新建 lane。
 
 `solve` 优先走页面自带的 turnstile 模块（`import` chatgpt.com 自己的 chunk 后调用
 `getEnforcementToken`）。这个 chunk 文件名带内容哈希、每次发版都变，所以运行时**动态发现**：先看页面
@@ -32,10 +39,15 @@ Turnstile。主服务本身不打包浏览器，只通过 HTTP 调用这里。
 `/v1/request` 会接收账号 Authorization 和 JSON 请求体，并返回账号信息或 sentinel 数据。
 服务端过滤 Cookie、User-Agent、Sec-*、Origin 等浏览器自管头，保留 Authorization；限制目标路径并禁止重定向。
 请把 solver 当作可信服务，仅在内网提供访问，并配置访问密钥。对话 prompt 和 SSE 仍由主服务发送。
+`/health` 是探活接口、不校验密钥，而它现在会带上各 lane 的 chatgpt.com cookie（`__cf_bm` / `_cfuvid`
+/ `oai-did`）：这些 cookie 本身绑定出口 IP，泄露价值有限，但不能把本服务暴露到不可信网络。
 
 账号刷新和 sentinel prepare/finalize 优先走浏览器；未配置、不可达或旧 solver 不支持此端点时回退到 curl。
-真实 HTTP 401/JSON 403 直接交给原错误处理；仅 Cloudflare challenge 403 会重试。三个账号刷新接口串行调用。
-solver 与主服务必须使用同一出口；本 PR 不包含出口代理池、proxy_id 自动绑定或按账号切换浏览器出口。
+真实 HTTP 401/JSON 403 直接交给原错误处理；仅 Cloudflare challenge 403 会重试——主服务把重试挂在 session
+的动词上，所以图片上传、对话下载、模型列表等所有上游调用都会重试，重试前清理 Cloudflare 挑战自己留下的
+cookie，但保留 solver 给的这份。三个账号刷新接口串行调用。
+solver 与主服务必须使用同一出口：每个出口一条 lane，lane key 含代理凭据（住宅代理常共用同一 host:port、
+靠用户名区分出口）；主服务只同步自己那条 lane 的 cookie。
 
 ## 部署
 

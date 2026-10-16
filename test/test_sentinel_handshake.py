@@ -51,7 +51,7 @@ class ImageModelSlugTests(unittest.TestCase):
 
 class SolverClientTests(unittest.TestCase):
     def setUp(self):
-        sentinel_solver_client._user_agent_cache.update(url="", value="", expires_at=0.0)
+        sentinel_solver_client._health_cache.clear()
 
     def _config(self, url: str = "http://solver:8080", key: str = "secret"):
         return mock.patch.object(
@@ -102,6 +102,52 @@ class SolverClientTests(unittest.TestCase):
             sentinel_solver_client.requests, "get", side_effect=OSError("connection refused")
         ):
             self.assertEqual(sentinel_solver_client.solver_user_agent(), "")
+
+    def test_the_ua_and_the_exits_cookies_come_from_one_call(self):
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {
+            "user_agent": "UA-from-solver",
+            "exit": {"lane": "abc", "warmed": True, "cookies": {"__cf_bm": "cleared", "oai-did": "device"}},
+        }
+        with self._config(), mock.patch.object(
+            sentinel_solver_client.requests, "get", return_value=response
+        ) as get:
+            user_agent, cookies = sentinel_solver_client.solver_identity("http://exit-us-1:8080")
+        self.assertEqual(user_agent, "UA-from-solver")
+        self.assertEqual(cookies, {"__cf_bm": "cleared", "oai-did": "device"})
+        self.assertEqual(get.call_args.kwargs["params"], {"proxy": "http://exit-us-1:8080"})
+
+    def test_another_exits_cookies_are_never_borrowed(self):
+        """A `__cf_bm` is bound to the IP that earned it, so there is no shared set."""
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {
+            "user_agent": "UA",
+            "lanes": {"abc": {"cookies": {"__cf_bm": "earned-elsewhere"}}},
+            "exit": {"lane": None, "warmed": False, "cookies": {}},
+        }
+        with self._config(), mock.patch.object(sentinel_solver_client.requests, "get", return_value=response):
+            self.assertEqual(sentinel_solver_client.solver_cookies("http://exit-us-2:8080"), {})
+            # Not even when the caller cannot name an exit: the solver's own default
+            # egress is a different IP, so its cookies would be worse than none.
+            self.assertEqual(sentinel_solver_client.solver_cookies(""), {})
+
+    def test_the_flat_lanes_map_is_not_used_as_a_fallback(self):
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"user_agent": "UA", "exit": "not-a-dict", "cookies": {"__cf_bm": "global"}}
+        with self._config(), mock.patch.object(sentinel_solver_client.requests, "get", return_value=response):
+            self.assertEqual(sentinel_solver_client.solver_cookies("http://exit-us-1:8080"), {})
+            self.assertEqual(sentinel_solver_client.solver_user_agent(), "UA")
+
+    def test_every_exit_is_cached_on_its_own(self):
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"user_agent": "UA", "exit": {"cookies": {"__cf_bm": "cleared"}}}
+        with self._config(), mock.patch.object(
+            sentinel_solver_client.requests, "get", return_value=response
+        ) as get:
+            sentinel_solver_client.solver_cookies("http://exit-a:8080")
+            sentinel_solver_client.solver_cookies("http://exit-a:8080")
+            sentinel_solver_client.solver_cookies("http://exit-b:8080")
+        self.assertEqual(get.call_count, 2)
 
     def test_prepare_response_is_forwarded_without_account_material(self):
         response = mock.Mock(status_code=200)

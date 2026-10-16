@@ -8,6 +8,11 @@ The solver keeps a headless Chromium on that page and computes the token for us.
 
 The JSON browser route forwards account Authorization to the trusted solver.
 Conversation prompts and streaming responses continue to use the main service.
+
+Cloudflare also scores some paths per client rather than per request, so this module
+hands back the cookies the cleared page holds alongside its user agent
+(`solver_identity`), keyed by the egress that earned them. The backend adopts them on
+its session before the first upstream call; see `_apply_solver_cookies`.
 """
 
 from __future__ import annotations
@@ -23,13 +28,17 @@ from utils.log import logger
 SOLVER_TIMEOUT_SECONDS = 20
 # Solving waits on the page's own module, which can take a moment on a cold page.
 SOLVER_SOLVE_TIMEOUT_SECONDS = 60
-USER_AGENT_CACHE_SECONDS = 600
+HEALTH_CACHE_SECONDS = 600
 # A failed health probe is cached briefly too, so a solver that is down does not
-# get probed once per request.
-USER_AGENT_FAILURE_CACHE_SECONDS = 30
+# get probed once per request, per exit.
+HEALTH_FAILURE_CACHE_SECONDS = 30
 
-_user_agent_lock = threading.Lock()
-_user_agent_cache: dict[str, object] = {"url": "", "value": "", "expires_at": 0.0}
+_health_lock = threading.Lock()
+# Caches one `/health` answer per egress, because the interesting half of it (the
+# cleared page's cookies) is bound to the exit that earned it and every session has to
+# be handed its own set. Keyed by (solver url, egress), so a reconfigured solver or a
+# different exit never reads another's entry.
+_health_cache: dict[tuple[str, str], dict[str, object]] = {}
 
 
 class SentinelSolverError(RuntimeError):
@@ -43,34 +52,86 @@ def _solver_headers() -> dict[str, str]:
     return headers
 
 
-def solver_user_agent() -> str:
-    """User agent of the page that computes the Turnstile token, or "" when unset.
+def _health(proxy: str = "") -> dict[str, object]:
+    """Cached `/health` for one egress, or {} when the solver is unset or unreachable.
 
-    The requirements/proof tokens embed the UA, and it has to match the browser
-    environment that solved the challenge; otherwise the conversation endpoint
-    answers `404 {"detail": "Model not found"}`.
+    A non-empty `proxy` asks the solver about that exit specifically and gets back its
+    captured cookies; without one only the browser-wide user agent is meaningful.
     """
     base_url = config.sentinel_solver_url
     if not base_url:
-        return ""
-    with _user_agent_lock:
+        return {}
+    exit_key = str(proxy or "").strip()
+    cache_key = (base_url, exit_key)
+    with _health_lock:
         now = time.monotonic()
-        if _user_agent_cache["url"] == base_url and now < float(_user_agent_cache["expires_at"]):
-            return str(_user_agent_cache["value"])
-        value = ""
+        for key in [k for k, entry in _health_cache.items() if now >= float(entry["expires_at"])]:
+            del _health_cache[key]
+        cached = _health_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+        payload: dict[str, object] = {}
+        request_kwargs: dict[str, object] = {}
+        if exit_key:
+            request_kwargs["params"] = {"proxy": exit_key}
         try:
             response = requests.get(
                 f"{base_url}/health",
                 headers=_solver_headers(),
                 timeout=SOLVER_TIMEOUT_SECONDS,
+                **request_kwargs,
             )
             if response.status_code == 200:
-                value = str((response.json() or {}).get("user_agent") or "")
+                body = response.json() or {}
+                if isinstance(body, dict):
+                    payload = body
         except Exception as exc:  # noqa: BLE001
             logger.warning({"event": "sentinel_solver_health_error", "error": str(exc)})
-        ttl = USER_AGENT_CACHE_SECONDS if value else USER_AGENT_FAILURE_CACHE_SECONDS
-        _user_agent_cache.update(url=base_url, value=value, expires_at=now + ttl)
-        return value
+        user_agent = str(payload.get("user_agent") or "")
+        exit_info = payload.get("exit") if isinstance(payload.get("exit"), dict) else {}
+        cookies = {
+            str(name): str(value)
+            for name, value in (exit_info.get("cookies") or {}).items()
+            if name and value
+        }
+        ttl = HEALTH_CACHE_SECONDS if user_agent else HEALTH_FAILURE_CACHE_SECONDS
+        _health_cache[cache_key] = {
+            "user_agent": user_agent,
+            "cookies": cookies,
+            "warmed": bool(exit_info.get("warmed")),
+            "expires_at": now + ttl,
+        }
+        return dict(_health_cache[cache_key])
+
+
+def solver_identity(proxy: str = "") -> tuple[str, dict[str, str]]:
+    """The solver page's (user_agent, cookies) for `proxy`, or ("", {}) when unavailable.
+
+    One cached `/health` call answers both halves, but they belong together for a
+    reason: the cookies are bound to the egress that earned them, so pass the session's
+    own exit. A `__cf_bm` from another exit does nothing for this request, and the
+    solver's own default egress is not ours, so an unnamed exit gets no cookies at all
+    rather than somebody else's.
+
+    - UA: the requirements/proof tokens embed it and it has to match the browser that
+      solved the challenge; otherwise the conversation endpoint answers
+      `404 {"detail": "Model not found"}`.
+    - cookies: mainly Cloudflare's `__cf_bm` / `_cfuvid`. Cloudflare scores some paths
+      (sentinel/chat-requirements) per client: a bare curl_cffi request is challenged
+      persistently without them and is let through with them.
+    """
+    health = _health(proxy)
+    return str(health.get("user_agent") or ""), dict(health.get("cookies") or {})
+
+
+def solver_user_agent() -> str:
+    """User agent of the page that computes the Turnstile token, or "" when unset."""
+    return solver_identity()[0]
+
+
+def solver_cookies(proxy: str = "") -> dict[str, str]:
+    """Cookies the cleared solver page holds for `proxy` (Cloudflare per-path checks)."""
+    return solver_identity(proxy)[1]
 
 
 def solve_turnstile(dx: str, p: str, requirements: dict | None = None, proxy: str = "") -> str:
