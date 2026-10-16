@@ -9,6 +9,7 @@ from unittest import mock
 from services import openai_backend_api as backend
 from services import sentinel_solver_client as client
 from services.account_service import AccountService
+from utils.identity import identity_timezone_offset_min
 
 
 class BrowserRoutingTests(unittest.TestCase):
@@ -38,7 +39,8 @@ class BrowserRoutingTests(unittest.TestCase):
         self.assertEqual(result["type"], "plus")
         self.assertEqual([c.args[1].split("chatgpt.com")[1] for c in browser.call_args_list], [
             "/backend-api/me", "/backend-api/conversation/init",
-            "/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=-480",
+            # The offset flips with US daylight saving, so it is never a literal here.
+            f"/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min={identity_timezone_offset_min()}",
         ])
         for call in browser.call_args_list:
             headers = call.args[2]
